@@ -1,8 +1,10 @@
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -18,6 +20,16 @@ from app.repositories.organizations import OrganizationRepository
 from app.services.errors import OrganizationNotFound
 from app.services.jobs import JobService
 from app.services.organizations import OrganizationService
+
+
+def _create_due_job(organization_id, sessions, *, scheduled_at=None):
+    return JobService(JobRepository(sessions)).submit(
+        organization_id=organization_id,
+        job_type="test.claim",
+        payload={"marker": str(uuid4())},
+        scheduled_at=scheduled_at or datetime.now(UTC),
+        max_attempts=3,
+    )
 
 
 @pytest.fixture
@@ -147,3 +159,112 @@ finally:
                     delete(Organization).where(Organization.id == organization_id)
                 )
         restarted_engine.dispose()
+
+
+@pytest.mark.integration
+def test_sequential_claim_is_unique_and_records_ownership(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"claim-test-{uuid4()}", max_concurrent_jobs=1)
+    job = _create_due_job(organization.id, sessions)
+    try:
+        repository = JobRepository(sessions)
+        claims = repository.claim_due_jobs("consumer-a", lease_seconds=45)
+
+        assert len(claims) == 1
+        claim = next(claim for claim in claims if claim.job_id == job.id)
+        assert claim.owner == "consumer-a"
+        assert claim.attempts == 1
+        assert claim.max_attempts == 3
+        assert claim.claim_token is not None
+        assert claim.lease_expires_at > datetime.now(UTC)
+        assert repository.claim_due_jobs("consumer-b") == []
+
+        persisted_job = repository.get_by_id(job.id)
+        assert persisted_job is not None
+        assert persisted_job.status == JobStatus.RUNNING
+        assert persisted_job.locked_by == "consumer-a"
+        assert persisted_job.claim_token == claim.claim_token
+        assert persisted_job.attempts == 1
+        assert persisted_job.started_at is None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_future_job_is_not_claimed_early(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"future-claim-test-{uuid4()}", max_concurrent_jobs=1)
+    job = _create_due_job(
+        organization.id,
+        sessions,
+        scheduled_at=datetime.now(UTC) + timedelta(days=1),
+    )
+    try:
+        repository = JobRepository(sessions)
+        claims = repository.claim_due_jobs("consumer-future")
+
+        assert all(claim.job_id != job.id for claim in claims)
+        assert repository.get_by_id(job.id).status == JobStatus.SCHEDULED
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_concurrent_claimers_cannot_both_claim_the_same_job(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"concurrent-claim-test-{uuid4()}", max_concurrent_jobs=1)
+    job = _create_due_job(organization.id, sessions)
+    barrier = Barrier(2)
+
+    def claim_as(owner: str):
+        repository = JobRepository(sessions)
+        barrier.wait(timeout=10)
+        return repository.claim_due_jobs(owner, limit=1)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(claim_as, "consumer-one"),
+                executor.submit(claim_as, "consumer-two"),
+            ]
+            claims_by_consumer = [future.result(timeout=20) for future in futures]
+
+        all_claims = [
+            claim for consumer_claims in claims_by_consumer for claim in consumer_claims
+        ]
+        claims_for_job = [claim for claim in all_claims if claim.job_id == job.id]
+        assert len(claims_for_job) == 1
+        assert claims_for_job[0].attempts == 1
+        assert len({claim.claim_token for claim in all_claims}) == len(all_claims)
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()

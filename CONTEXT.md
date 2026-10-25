@@ -15,3 +15,7 @@ _Avoid_: Task, message
 **Attempt**:
 One committed claim of a job for execution; a claim that later expires still counts toward the job's attempt limit.
 _Avoid_: Retry count, worker start count
+
+**Claim**:
+Temporary ownership of a job by one consumer, identified by a unique token and bounded by a lease.
+_Avoid_: Reservation, lock

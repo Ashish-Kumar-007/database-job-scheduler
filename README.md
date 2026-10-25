@@ -52,6 +52,17 @@ committed claims, including claims later recovered after lease expiry; waiting
 jobs must have an attempt remaining. Timestamps are stored as timezone-aware
 PostgreSQL timestamps.
 
+## Phase 3: atomic claims
+
+`JobRepository.claim_due_jobs(owner, limit, lease_seconds)` claims only due
+`scheduled` jobs and due `retry_wait` jobs. It checks eligibility against
+PostgreSQL `clock_timestamp()`, locks eligible rows with
+`FOR UPDATE SKIP LOCKED`, assigns a fresh claim token and lease, increments
+`attempts`, then commits before returning claim snapshots. The batch size is
+bounded to 100. A claim does not set `started_at`; that timestamp belongs to
+the later worker-start transition. Tenant fairness and concurrency limits are
+not yet enforced by claiming and are deferred to their dedicated phase.
+
 Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 `docker compose down --volumes` removes the local database volume.
 
