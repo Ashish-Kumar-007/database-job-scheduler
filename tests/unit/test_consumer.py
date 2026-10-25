@@ -7,6 +7,7 @@ from sqlalchemy.engine import URL
 
 from app.config import Settings
 from app.consumers import Consumer
+from app.consumers.runner import _SchedulingDelayMetrics
 from app.handlers import HandlerRegistry
 from app.repositories.jobs import JobClaim
 from app.workers import WorkerPool
@@ -108,6 +109,37 @@ def test_consumer_does_not_claim_past_bounded_run_outcome_limit() -> None:
     assert result.claimed == 1
     assert result.completed == 1
     assert len(repository.claims) == 2
+
+
+def test_consumer_reports_throughput_and_scheduling_delay_statistics() -> None:
+    repository = PollingRepository([make_claim()])
+    handlers = HandlerRegistry()
+    handlers.register("sample.success", lambda *args: "ok")
+    pool = WorkerPool(repository, handlers, max_workers=1)
+
+    result = Consumer(
+        make_settings(worker_concurrency=1),
+        repository,
+        pool,
+    ).run(Event(), max_completed=1)
+
+    assert result.completed == 1
+    assert result.elapsed_seconds > 0
+    assert result.completed_per_second > 0
+    assert result.scheduling_delay_average_seconds is not None
+    assert result.scheduling_delay_max_seconds >= result.scheduling_delay_average_seconds
+    assert result.scheduling_delay_p95_seconds >= result.scheduling_delay_average_seconds
+
+
+def test_scheduling_delay_metrics_bound_memory_and_keep_exact_aggregates() -> None:
+    metrics = _SchedulingDelayMetrics()
+    for delay in range(metrics.MAX_RESERVOIR_SIZE + 1):
+        metrics.record(float(delay))
+
+    assert metrics.count == metrics.MAX_RESERVOIR_SIZE + 1
+    assert metrics.total_seconds / metrics.count == metrics.MAX_RESERVOIR_SIZE / 2
+    assert metrics.maximum_seconds == float(metrics.MAX_RESERVOIR_SIZE)
+    assert len(metrics.reservoir) == metrics.MAX_RESERVOIR_SIZE
 
 
 def test_consumer_keeps_polling_when_no_jobs_are_due() -> None:

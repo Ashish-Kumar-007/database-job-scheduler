@@ -3,8 +3,8 @@
 This repository provides validated PostgreSQL settings, SQLAlchemy models and
 migrations, job submission and retrieval, atomic claims, handler registration,
 bounded worker execution, independent consumer processes, lease renewal and
-recovery, bounded retries, and a durable idempotent sample operation.
-Multi-tenant fair scheduling is not implemented yet.
+recovery, bounded retries, multi-tenant fair scheduling, and a durable
+idempotent sample operation.
 
 ## Requirements
 
@@ -96,9 +96,13 @@ configured lease duration. Consumers periodically recover expired claims with
 `FOR UPDATE SKIP LOCKED`; recovery clears stale ownership and either schedules
 a retry or marks the job failed when attempts are exhausted. Attempts count
 committed claims, so a worker killed after claim still consumes an attempt.
-The first execution records `started_at - scheduled_at` as scheduling delay;
-retry executions instead record elapsed time since their `next_attempt_at`,
-keeping retry waiting distinct from the original scheduling delay.
+Every execution records `started_at - scheduled_at` as scheduling delay.
+Retry attempts additionally record elapsed time since their `next_attempt_at`,
+so retry waiting is measurable separately from lateness against the original
+schedule. Consumer summaries report completed jobs per second and exact
+average/maximum scheduling delay. The p95 is estimated from a uniform reservoir
+of up to 10,000 execution delays, keeping metrics memory bounded during
+long-running consumer processes.
 
 Retryable handler failures use capped exponential backoff with configurable
 jitter (`RETRY_BASE_SECONDS`, `RETRY_MAX_SECONDS`, and

@@ -38,6 +38,8 @@ class ExecutionResult:
     outcome: ExecutionOutcome
     result: object | None = None
     error: str | None = None
+    scheduling_delay_seconds: float | None = None
+    retry_wait_seconds: float | None = None
 
 
 class WorkerPool:
@@ -126,6 +128,7 @@ class WorkerPool:
                     "organization_id": str(claim.organization_id),
                     "consumer_id": claim.owner,
                     "attempt": claim.attempts,
+                    "event_type": "stale_claim_rejected",
                 },
             )
             return ExecutionResult(claim.job_id, ExecutionOutcome.STALE_CLAIM)
@@ -150,8 +153,6 @@ class WorkerPool:
         )
         scheduling_delay_seconds = (
             max(0.0, (started_at - claim.scheduled_at).total_seconds())
-            if claim.retry_eligible_at is None
-            else None
         )
         retry_wait_seconds = (
             max(0.0, (started_at - claim.retry_eligible_at).total_seconds())
@@ -167,6 +168,7 @@ class WorkerPool:
                 "organization_id": str(claim.organization_id),
                 "consumer_id": claim.owner,
                 "attempt": claim.attempts,
+                "event_type": "job_started",
                 "scheduled_at": claim.scheduled_at.isoformat(),
                 "started_at": started_at.isoformat(),
                 "scheduling_delay_seconds": scheduling_delay_seconds,
@@ -211,18 +213,45 @@ class WorkerPool:
                             "organization_id": str(claim.organization_id),
                             "consumer_id": claim.owner,
                             "attempt": claim.attempts,
+                            "event_type": "stale_claim_rejected",
                         },
                     )
                     return ExecutionResult(
                         claim.job_id,
                         ExecutionOutcome.STALE_CLAIM,
+                        scheduling_delay_seconds=scheduling_delay_seconds,
+                        retry_wait_seconds=retry_wait_seconds,
                     )
                 outcome = (
                     ExecutionOutcome.RETRY_SCHEDULED
                     if persisted_status == JobStatus.RETRY_WAIT
                     else ExecutionOutcome.FAILED
                 )
-                return ExecutionResult(claim.job_id, outcome, error=message)
+                logger.info(
+                    "Job attempt ended event_type=%s",
+                    "job_retry_scheduled"
+                    if persisted_status == JobStatus.RETRY_WAIT
+                    else "job_failed",
+                    extra={
+                        "job_id": str(claim.job_id),
+                        "organization_id": str(claim.organization_id),
+                        "consumer_id": claim.owner,
+                        "attempt": claim.attempts,
+                        "event_type": (
+                            "job_retry_scheduled"
+                            if persisted_status == JobStatus.RETRY_WAIT
+                            else "job_failed"
+                        ),
+                        "status": persisted_status.value,
+                    },
+                )
+                return ExecutionResult(
+                    claim.job_id,
+                    outcome,
+                    error=message,
+                    scheduling_delay_seconds=scheduling_delay_seconds,
+                    retry_wait_seconds=retry_wait_seconds,
+                )
 
             completed = self._repository.complete_claim(claim)
             if not completed:
@@ -233,13 +262,31 @@ class WorkerPool:
                         "organization_id": str(claim.organization_id),
                         "consumer_id": claim.owner,
                         "attempt": claim.attempts,
+                        "event_type": "stale_claim_rejected",
                     },
                 )
-                return ExecutionResult(claim.job_id, ExecutionOutcome.STALE_CLAIM)
+                return ExecutionResult(
+                    claim.job_id,
+                    ExecutionOutcome.STALE_CLAIM,
+                    scheduling_delay_seconds=scheduling_delay_seconds,
+                    retry_wait_seconds=retry_wait_seconds,
+                )
+            logger.info(
+                "Job attempt completed",
+                extra={
+                    "job_id": str(claim.job_id),
+                    "organization_id": str(claim.organization_id),
+                    "consumer_id": claim.owner,
+                    "attempt": claim.attempts,
+                    "event_type": "job_completed",
+                },
+            )
             return ExecutionResult(
                 claim.job_id,
                 ExecutionOutcome.COMPLETED,
                 result=result,
+                scheduling_delay_seconds=scheduling_delay_seconds,
+                retry_wait_seconds=retry_wait_seconds,
             )
         finally:
             lease_renewer.stop()
@@ -285,6 +332,7 @@ class _LeaseRenewer:
                         "organization_id": str(self._claim.organization_id),
                         "consumer_id": self._claim.owner,
                         "attempt": self._claim.attempts,
+                        "event_type": "lease_renewal_failed",
                     },
                 )
                 continue
@@ -296,6 +344,7 @@ class _LeaseRenewer:
                         "organization_id": str(self._claim.organization_id),
                         "consumer_id": self._claim.owner,
                         "attempt": self._claim.attempts,
+                        "event_type": "lease_ownership_lost",
                     },
                 )
                 return
@@ -306,5 +355,6 @@ class _LeaseRenewer:
                     "organization_id": str(self._claim.organization_id),
                     "consumer_id": self._claim.owner,
                     "attempt": self._claim.attempts,
+                    "event_type": "lease_renewed",
                 },
             )

@@ -2,6 +2,7 @@ import math
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import logging
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select, update
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.models import Job, JobStatus, Organization, SampleOperation
 from app.services.errors import InputValidationError, OrganizationNotFound
 from app.services.inputs import JobSubmission
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,19 @@ class JobRepository:
             )
             session.add(job)
             session.flush()
+            logger.info(
+                "Job created job_id=%s organization_id=%s",
+                job.id,
+                job.organization_id,
+                extra={
+                    "job_id": str(job.id),
+                    "organization_id": str(job.organization_id),
+                    "consumer_id": None,
+                    "attempt": 0,
+                    "scheduled_at": job.scheduled_at.isoformat(),
+                    "event_type": "job_created",
+                },
+            )
         return job
 
     def claim_due_jobs(

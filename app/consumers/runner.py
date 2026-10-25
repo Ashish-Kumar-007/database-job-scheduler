@@ -1,7 +1,8 @@
 import logging
+import math
 import random
 from concurrent.futures import FIRST_COMPLETED, Future, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Event
 from time import monotonic
 
@@ -14,6 +15,30 @@ from app.workers import ExecutionOutcome, ExecutionResult, WorkerCapacityError, 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _SchedulingDelayMetrics:
+    count: int = 0
+    total_seconds: float = 0
+    maximum_seconds: float | None = None
+    reservoir: list[float] = field(default_factory=list)
+
+    MAX_RESERVOIR_SIZE = 10_000
+
+    def record(self, delay_seconds: float) -> None:
+        self.count += 1
+        self.total_seconds += delay_seconds
+        if self.maximum_seconds is None or delay_seconds > self.maximum_seconds:
+            self.maximum_seconds = delay_seconds
+
+        if len(self.reservoir) < self.MAX_RESERVOIR_SIZE:
+            self.reservoir.append(delay_seconds)
+            return
+
+        replacement_index = random.randrange(self.count)
+        if replacement_index < self.MAX_RESERVOIR_SIZE:
+            self.reservoir[replacement_index] = delay_seconds
+
+
 @dataclass(frozen=True)
 class ConsumerResult:
     claimed: int
@@ -22,6 +47,11 @@ class ConsumerResult:
     failed: int
     stale: int
     recovered: int
+    elapsed_seconds: float
+    scheduling_delay_average_seconds: float | None
+    scheduling_delay_max_seconds: float | None
+    scheduling_delay_p95_seconds: float | None
+    completed_per_second: float
 
 
 class Consumer:
@@ -59,9 +89,11 @@ class Consumer:
         }
         consecutive_database_errors = 0
         next_recovery_at = 0.0
+        run_started_at = monotonic()
+        scheduling_delays = _SchedulingDelayMetrics()
         try:
             while not stop_event.is_set():
-                self._collect_finished(pending, totals)
+                self._collect_finished(pending, totals, scheduling_delays)
                 finished = sum(
                     totals[key]
                     for key in ("completed", "retry_scheduled", "failed", "stale")
@@ -96,6 +128,7 @@ class Consumer:
                                         "consumer_id": self._settings.consumer_id,
                                         "attempt": item.attempts,
                                         "status": item.status.value,
+                                        "event_type": "job_recovered",
                                     },
                                 )
                             next_recovery_at = (
@@ -116,6 +149,7 @@ class Consumer:
                                 "consumer_id": self._settings.consumer_id,
                                 "retry_in_seconds": delay,
                                 "error_type": type(error).__name__,
+                                "event_type": "database_poll_failed",
                             },
                         )
                         stop_event.wait(delay)
@@ -131,6 +165,7 @@ class Consumer:
                                 "consumer_id": self._settings.consumer_id,
                                 "retry_in_seconds": delay,
                                 "error_type": type(error).__name__,
+                                "event_type": "database_connection_invalidated",
                             },
                         )
                         stop_event.wait(delay)
@@ -151,6 +186,7 @@ class Consumer:
                                     "job_id": str(claim.job_id),
                                     "organization_id": str(claim.organization_id),
                                     "attempt": claim.attempts,
+                                    "event_type": "job_claimed",
                                 },
                             )
                         except WorkerCapacityError:
@@ -160,6 +196,7 @@ class Consumer:
                                     "consumer_id": self._settings.consumer_id,
                                     "job_id": str(claim.job_id),
                                     "organization_id": str(claim.organization_id),
+                                    "event_type": "claim_dispatch_failed",
                                 },
                             )
                             raise
@@ -173,14 +210,32 @@ class Consumer:
                 else:
                     stop_event.wait(self._settings.poll_interval_seconds)
         finally:
-            self._drain(pending, totals, stop_event)
+            self._drain(pending, totals, stop_event, scheduling_delays)
 
-        return ConsumerResult(**totals)
+        elapsed_seconds = max(monotonic() - run_started_at, 1e-9)
+        delays = sorted(scheduling_delays.reservoir)
+        return ConsumerResult(
+            **totals,
+            elapsed_seconds=elapsed_seconds,
+            scheduling_delay_average_seconds=(
+                scheduling_delays.total_seconds / scheduling_delays.count
+                if scheduling_delays.count
+                else None
+            ),
+            scheduling_delay_max_seconds=scheduling_delays.maximum_seconds,
+            scheduling_delay_p95_seconds=(
+                delays[max(0, math.ceil(len(delays) * 0.95) - 1)]
+                if delays
+                else None
+            ),
+            completed_per_second=totals["completed"] / elapsed_seconds,
+        )
 
     def _collect_finished(
         self,
         pending: dict[Future[ExecutionResult], JobClaim],
         totals: dict[str, int],
+        scheduling_delays: _SchedulingDelayMetrics,
     ) -> None:
         for future, claim in list(pending.items()):
             if not future.done():
@@ -196,6 +251,7 @@ class Consumer:
                         "job_id": str(claim.job_id),
                         "organization_id": str(claim.organization_id),
                         "attempt": claim.attempts,
+                        "event_type": "worker_execution_error",
                     },
                 )
                 continue
@@ -206,6 +262,8 @@ class Consumer:
                 ExecutionOutcome.STALE_CLAIM: "stale",
             }[result.outcome]
             totals[outcome_counter] += 1
+            if result.scheduling_delay_seconds is not None:
+                scheduling_delays.record(result.scheduling_delay_seconds)
             logger.info(
                 "Job execution finished job_id=%s organization_id=%s "
                 "attempt=%s outcome=%s",
@@ -219,6 +277,9 @@ class Consumer:
                     "organization_id": str(claim.organization_id),
                     "attempt": claim.attempts,
                     "outcome": result.outcome.value,
+                    "event_type": f"job_{result.outcome.value}",
+                    "scheduling_delay_seconds": result.scheduling_delay_seconds,
+                    "retry_wait_seconds": result.retry_wait_seconds,
                 },
             )
 
@@ -227,6 +288,7 @@ class Consumer:
         pending: dict[Future[ExecutionResult], JobClaim],
         totals: dict[str, int],
         stop_event: Event,
+        scheduling_delays: _SchedulingDelayMetrics,
     ) -> None:
         if pending:
             _, unfinished = wait(
@@ -243,7 +305,7 @@ class Consumer:
                     },
                 )
         self._worker_pool.shutdown(wait=True)
-        self._collect_finished(pending, totals)
+        self._collect_finished(pending, totals, scheduling_delays)
 
     def _reconnect_delay(self, failure_count: int) -> float:
         exponential_delay = min(

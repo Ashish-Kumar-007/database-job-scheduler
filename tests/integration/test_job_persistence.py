@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import uuid4
 
 import pytest
@@ -22,6 +22,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import sessionmaker
 
+from app.config import Settings
+from app.consumers import Consumer
 from app.handlers import HandlerRegistry
 from app.handlers.sample import IdempotentSampleHandler
 from app.models import Job, JobStatus, Organization, SampleOperation
@@ -157,6 +159,7 @@ finally:
             [sys.executable, "-c", child_script],
             cwd=Path(__file__).resolve().parents[2],
             env=child_environment,
+            stdin=subprocess.DEVNULL,
             check=True,
             capture_output=True,
             text=True,
@@ -185,6 +188,100 @@ finally:
                     delete(Organization).where(Organization.id == organization_id)
                 )
         restarted_engine.dispose()
+
+
+@pytest.mark.integration
+def test_consumer_drains_backlog_and_reports_delay_statistics(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organizations = []
+    jobs = []
+    try:
+        organization_service = OrganizationService(OrganizationRepository(sessions))
+        organizations = [
+            organization_service.create(
+                f"backlog-test-{index}-{uuid4()}",
+                max_concurrent_jobs=4,
+            )
+            for index in range(3)
+        ]
+        scheduled_at = datetime.now(UTC) - timedelta(seconds=2)
+        job_service = JobService(JobRepository(sessions))
+        jobs = [
+            job_service.submit(
+                organization_id=organization.id,
+                job_type="sample.backlog",
+                payload={"index": index},
+                scheduled_at=scheduled_at,
+                max_attempts=2,
+            )
+            for index, organization in enumerate(organizations * 10)
+        ]
+
+        repository = JobRepository(sessions)
+        handlers = HandlerRegistry()
+        handlers.register("sample.backlog", lambda *args: "ok")
+        settings = Settings(
+            database_url=migrated_test_database,
+            db_pool_size=5,
+            db_max_overflow=10,
+            consumer_id=f"backlog-consumer-{uuid4()}",
+            worker_concurrency=4,
+            poll_interval_seconds=0.01,
+            claim_batch_size=10,
+            lease_seconds=30,
+            shutdown_grace_seconds=2,
+            reconnect_base_seconds=0.01,
+            reconnect_max_seconds=1,
+            retry_base_seconds=0.01,
+            retry_max_seconds=1,
+            retry_jitter_ratio=0,
+            lease_reap_interval_seconds=1,
+        )
+        result = Consumer(
+            settings,
+            repository,
+            WorkerPool(repository, handlers, max_workers=4),
+        ).run(Event(), max_completed=len(jobs))
+
+        assert result.claimed == len(jobs)
+        assert result.completed == len(jobs)
+        assert result.failed == 0
+        assert result.stale == 0
+        assert result.completed_per_second > 0
+        assert result.scheduling_delay_average_seconds is not None
+        assert result.scheduling_delay_max_seconds >= (
+            result.scheduling_delay_average_seconds
+        )
+        assert result.scheduling_delay_p95_seconds is not None
+        persisted = [repository.get_by_id(job.id) for job in jobs]
+        assert all(
+            job is not None and job.status == JobStatus.COMPLETED
+            for job in persisted
+        )
+        assert all(
+            job is not None
+            and job.started_at is not None
+            and job.completed_at is not None
+            and job.started_at >= job.scheduled_at
+            and job.completed_at >= job.started_at
+            for job in persisted
+        )
+    finally:
+        with engine.begin() as connection:
+            if jobs:
+                connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            if organizations:
+                connection.execute(
+                    delete(Organization).where(
+                        Organization.id.in_(
+                            [organization.id for organization in organizations]
+                        )
+                    )
+                )
+        engine.dispose()
 
 
 @pytest.mark.integration
@@ -385,7 +482,7 @@ try:
         os.environ["CLAIM_PROCESS_ID"],
         limit=1,
     )
-    print(f"claimed={len(claims)}")
+    print("claimed=" + ",".join(str(claim.job_id) for claim in claims))
 finally:
     engine.dispose()
 """
@@ -401,6 +498,7 @@ finally:
                         [sys.executable, "-c", child_script],
                         cwd=project_root,
                         env=child_environment,
+                        stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
@@ -411,7 +509,13 @@ finally:
                 for process in processes
             ]
             assert all(process.returncode == 0 for process in processes), outputs
-            assert sum(int(output.strip().split("=")[1]) for output in outputs) == 1
+            claimed_job_ids = [
+                job_id
+                for output in outputs
+                for job_id in output.strip().split("=", 1)[1].split(",")
+                if job_id
+            ]
+            assert sum(str(job.id) in claimed_job_ids for job in jobs) == 1, outputs
             running_jobs = [
                 job
                 for job in (JobRepository(sessions).get_by_id(item.id) for item in jobs)
@@ -534,7 +638,9 @@ def test_claim_completion_and_stale_token_rejection(
         completed_job = repository.get_by_id(job.id)
         assert completed_job is not None
         assert completed_job.status == JobStatus.COMPLETED
+        assert completed_job.started_at is not None
         assert completed_job.completed_at is not None
+        assert completed_job.completed_at >= completed_job.started_at
         assert completed_job.locked_by is None
         assert completed_job.claim_token is None
     finally:
@@ -745,6 +851,7 @@ finally:
             [sys.executable, "-c", child_script],
             cwd=project_root,
             env=environment,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -857,6 +964,7 @@ def test_two_consumer_processes_execute_distinct_jobs(
                     ],
                     cwd=project_root,
                     env=environment,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -935,13 +1043,16 @@ def test_consumer_worker_capacity_bounds_claimed_batch(
             ],
             cwd=Path(__file__).resolve().parents[2],
             env=environment,
+            stdin=subprocess.DEVNULL,
             check=True,
             capture_output=True,
             text=True,
             timeout=15,
         )
 
-        assert "claimed=3 completed=3" in result.stdout + result.stderr
+        assert "claimed=3 completed=3" in result.stdout + result.stderr, (
+            result.stdout + result.stderr
+        )
         persisted = [JobRepository(sessions).get_by_id(job.id) for job in jobs]
         assert all(
             job is not None and job.status == JobStatus.COMPLETED

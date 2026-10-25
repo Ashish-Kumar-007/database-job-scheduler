@@ -335,7 +335,7 @@ def test_worker_logs_retry_wait_separately_from_initial_schedule_delay() -> None
     )
     extra = start_log.kwargs["extra"]
     assert result.outcome == ExecutionOutcome.COMPLETED
-    assert extra["scheduling_delay_seconds"] is None
+    assert extra["scheduling_delay_seconds"] >= 1
     assert extra["retry_wait_seconds"] >= 1
 
 

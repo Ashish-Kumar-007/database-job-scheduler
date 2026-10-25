@@ -48,7 +48,11 @@ def main() -> None:
     def request_shutdown(signum: int, frame: object) -> None:
         logging.getLogger(__name__).info(
             "Consumer shutdown requested",
-            extra={"consumer_id": settings.consumer_id, "signal": signum},
+            extra={
+                "consumer_id": settings.consumer_id,
+                "signal": signum,
+                "event_type": "consumer_shutdown_requested",
+            },
         )
         stop_event.set()
 
@@ -74,7 +78,9 @@ def main() -> None:
         )
         logging.getLogger(__name__).info(
             "Consumer %s stopped claimed=%s completed=%s retry_scheduled=%s "
-            "failed=%s stale=%s recovered=%s",
+            "failed=%s stale=%s recovered=%s elapsed_seconds=%.3f "
+            "completed_per_second=%.3f scheduling_delay_avg_seconds=%s "
+            "scheduling_delay_max_seconds=%s scheduling_delay_p95_seconds=%s",
             settings.consumer_id,
             result.claimed,
             result.completed,
@@ -82,6 +88,11 @@ def main() -> None:
             result.failed,
             result.stale,
             result.recovered,
+            result.elapsed_seconds,
+            result.completed_per_second,
+            result.scheduling_delay_average_seconds,
+            result.scheduling_delay_max_seconds,
+            result.scheduling_delay_p95_seconds,
             extra={
                 "consumer_id": settings.consumer_id,
                 "claimed": result.claimed,
@@ -90,6 +101,16 @@ def main() -> None:
                 "failed": result.failed,
                 "stale": result.stale,
                 "recovered": result.recovered,
+                "elapsed_seconds": result.elapsed_seconds,
+                "completed_per_second": result.completed_per_second,
+                "scheduling_delay_average_seconds": (
+                    result.scheduling_delay_average_seconds
+                ),
+                "scheduling_delay_max_seconds": result.scheduling_delay_max_seconds,
+                "scheduling_delay_p95_seconds": (
+                    result.scheduling_delay_p95_seconds
+                ),
+                "event_type": "consumer_stopped",
             },
         )
     finally:
