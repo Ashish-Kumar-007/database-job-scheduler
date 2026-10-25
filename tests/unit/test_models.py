@@ -17,6 +17,7 @@ def test_domain_models_register_expected_tables_and_columns() -> None:
     assert organization_fk.target_fullname == "organizations.id"
     assert organization_fk.ondelete == "RESTRICT"
     assert Organization.__table__.c.id.primary_key
+    assert Organization.__table__.c.last_claimed_at.nullable
     assert SampleOperation.__table__.c.job_id.primary_key
     assert SampleOperation.__table__.c.idempotency_key.unique
 

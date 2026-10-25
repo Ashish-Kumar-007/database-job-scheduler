@@ -75,6 +75,8 @@ class Consumer:
                         self._settings.claim_batch_size,
                         available_slots,
                     )
+                    if max_completed is not None:
+                        claim_limit = min(claim_limit, max_completed - finished)
                     try:
                         if monotonic() >= next_recovery_at:
                             recovered = self._repository.recover_expired_claims(

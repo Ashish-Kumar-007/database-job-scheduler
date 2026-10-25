@@ -86,17 +86,71 @@ class JobRepository:
                     & (Job.next_attempt_at <= database_now)
                 ),
             )
-            jobs = list(
-                session.scalars(
+            has_due_jobs = (
+                select(Job.id)
+                .where(Job.organization_id == Organization.id, eligible)
+                .exists()
+            )
+            active_claim_count = (
+                select(func.count(Job.id))
+                .where(
+                    Job.organization_id == Organization.id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .correlate(Organization)
+                .scalar_subquery()
+            )
+            unstarted_claim_count = (
+                select(func.count(Job.id))
+                .where(
+                    Job.organization_id == Organization.id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.started_at.is_(None),
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .correlate(Organization)
+                .scalar_subquery()
+            )
+            skipped_organizations: set[UUID] = set()
+
+            while len(claims) < limit:
+                organization_query = (
+                    select(Organization)
+                    .where(
+                        has_due_jobs,
+                        active_claim_count < Organization.max_concurrent_jobs,
+                        unstarted_claim_count == 0,
+                    )
+                    .order_by(
+                        Organization.last_claimed_at.asc().nulls_first(),
+                        Organization.id,
+                    )
+                    .limit(1)
+                    .with_for_update(skip_locked=True, of=Organization)
+                )
+                if skipped_organizations:
+                    organization_query = organization_query.where(
+                        Organization.id.not_in(skipped_organizations)
+                    )
+                organization = session.scalar(organization_query)
+                if organization is None:
+                    break
+
+                job = session.scalar(
                     select(Job)
-                    .where(eligible)
+                    .where(
+                        Job.organization_id == organization.id,
+                        eligible,
+                    )
                     .order_by(Job.scheduled_at, Job.id)
-                    .limit(limit)
+                    .limit(1)
                     .with_for_update(skip_locked=True, of=Job)
                 )
-            )
+                if job is None:
+                    skipped_organizations.add(organization.id)
+                    continue
 
-            for job in jobs:
                 token = uuid4()
                 lease_expires_at = database_now + timedelta(seconds=lease_seconds)
                 retry_eligible_at = (
@@ -109,7 +163,9 @@ class JobRepository:
                 job.claim_token = token
                 job.lease_expires_at = lease_expires_at
                 job.next_attempt_at = None
+                job.started_at = None
                 job.attempts += 1
+                organization.last_claimed_at = func.clock_timestamp()
                 claims.append(
                     JobClaim(
                         job_id=job.id,

@@ -57,12 +57,26 @@ PostgreSQL timestamps.
 
 `JobRepository.claim_due_jobs(owner, limit, lease_seconds)` claims only due
 `scheduled` jobs and due `retry_wait` jobs. It checks eligibility against
-PostgreSQL `clock_timestamp()`, locks eligible rows with
+PostgreSQL `clock_timestamp()`, locks organizations and jobs with
 `FOR UPDATE SKIP LOCKED`, assigns a fresh claim token and lease, increments
 `attempts`, then commits before returning claim snapshots. The batch size is
 bounded to 100. A claim does not set `started_at`; that timestamp belongs to
-the later worker-start transition. Tenant fairness and concurrency limits are
-not yet enforced by claiming and are deferred to their dedicated phase.
+the later worker-start transition.
+
+Eligible organizations are selected in persistent round-robin order by
+oldest `last_claimed_at` (never-served organizations first); each scheduling
+turn claims at most one job from that organization. The organization row lock
+serializes capacity checks across consumer processes. A tenant is eligible
+only while its unexpired running claims are below `max_concurrent_jobs`, and
+while it has no unstarted claim. This permits at most one claimed-but-not-yet-
+started job per organization, independent of batch size. Per-organization
+limits are configured through `Organization.max_concurrent_jobs`.
+
+This provides dispatch fairness, not equal execution or completion times:
+jobs differ in duration, and long-running jobs continue to consume their
+tenant's active capacity. The policy does not promise strict latency bounds.
+See [the scheduling design](docs/design.md) for the policy and its fairness
+boundaries.
 
 ## Handlers and worker execution
 
@@ -156,10 +170,10 @@ python -m pytest
 ```
 
 PostgreSQL integration tests use a separate database URL, apply pending
-migrations, and verify persistence, concurrent claiming, lease recovery,
-process crashes, and idempotent operations. Point `TEST_DATABASE_URL` at a
-dedicated test database; do not point it at a database containing unrelated
-data:
+migrations, and verify persistence, concurrent claiming, tenant fairness,
+lease recovery, process crashes, and idempotent operations. Point
+`TEST_DATABASE_URL` at a dedicated test database; do not point it at a
+database containing unrelated data:
 
 ```powershell
 $env:TEST_DATABASE_URL = "postgresql+psycopg://scheduler:local-development-only@localhost:5432/scheduler_test"
@@ -174,5 +188,5 @@ python -m alembic upgrade head --sql
 ```
 
 PostgreSQL integration tests cover claims, leases, recovery, retries, process
-crashes, and idempotent sample operations when `TEST_DATABASE_URL` points to a
-dedicated PostgreSQL database. Tenant fairness remains for a later phase.
+crashes, tenant fairness and idempotent sample operations when
+`TEST_DATABASE_URL` points to a dedicated PostgreSQL database.

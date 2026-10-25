@@ -9,6 +9,8 @@ def create_engine(settings: Settings) -> Engine:
         pool_pre_ping=True,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
+        # Transaction-pooling proxies may route queries to different backends.
+        connect_args={"prepare_threshold": None},
     )
 
 

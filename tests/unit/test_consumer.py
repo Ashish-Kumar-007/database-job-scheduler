@@ -93,6 +93,23 @@ def test_consumer_polls_and_dispatches_without_exceeding_worker_capacity() -> No
     assert sum(repository.poll_limits) >= 3
 
 
+def test_consumer_does_not_claim_past_bounded_run_outcome_limit() -> None:
+    repository = PollingRepository([make_claim() for _ in range(3)])
+    handlers = HandlerRegistry()
+    handlers.register("sample.success", lambda *args: "ok")
+    pool = WorkerPool(repository, handlers, max_workers=2)
+
+    result = Consumer(
+        make_settings(worker_concurrency=2, claim_batch_size=10),
+        repository,
+        pool,
+    ).run(Event(), max_completed=1)
+
+    assert result.claimed == 1
+    assert result.completed == 1
+    assert len(repository.claims) == 2
+
+
 def test_consumer_keeps_polling_when_no_jobs_are_due() -> None:
     repository = PollingRepository()
     stop_event = Event()

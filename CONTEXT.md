@@ -31,3 +31,7 @@ _Avoid_: Cancellation, rollback
 **Idempotency key**:
 A stable identifier for one logical operation that lets a destination recognize repeated attempts as the same operation.
 _Avoid_: Claim token, attempt identifier
+
+**Dispatch fairness**:
+How eligible organizations share opportunities to have their jobs claimed, independently of how long those jobs take to finish.
+_Avoid_: Completion fairness, equal completion time

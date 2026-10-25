@@ -13,7 +13,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import (
-    create_engine as sqlalchemy_create_engine,
+    create_engine as _sqlalchemy_create_engine,
     delete,
     func,
     select,
@@ -31,6 +31,15 @@ from app.services.errors import OrganizationNotFound
 from app.services.jobs import JobService
 from app.services.organizations import OrganizationService
 from app.workers import ExecutionOutcome, WorkerPool
+
+
+def sqlalchemy_create_engine(*args, **kwargs):
+    connect_args = kwargs.pop("connect_args", {})
+    return _sqlalchemy_create_engine(
+        *args,
+        connect_args={**connect_args, "prepare_threshold": None},
+        **kwargs,
+    )
 
 
 def _create_due_job(
@@ -283,6 +292,216 @@ def test_concurrent_claimers_cannot_both_claim_the_same_job(
             connection.execute(delete(Job).where(Job.id == job.id))
             connection.execute(
                 delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_round_robin_claims_give_small_tenants_turns_and_bound_prefetch(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organizations = [
+        OrganizationService(OrganizationRepository(sessions)).create(
+            f"fairness-test-{index}-{uuid4()}",
+            max_concurrent_jobs=10,
+        )
+        for index in range(3)
+    ]
+    jobs = [
+        _create_due_job(organizations[0].id, sessions)
+        for _ in range(8)
+    ]
+    jobs.extend(
+        _create_due_job(organization.id, sessions)
+        for organization in organizations[1:]
+        for _ in range(3)
+    )
+    repository = JobRepository(sessions)
+    try:
+        first_turns = repository.claim_due_jobs("round-robin-test", limit=10)
+
+        assert len(first_turns) == 3
+        assert {claim.organization_id for claim in first_turns} == {
+            organization.id for organization in organizations
+        }
+        assert repository.claim_due_jobs("prefetch-test", limit=10) == []
+
+        for claim in first_turns:
+            assert repository.start_claim(claim) is not None
+
+        next_turns = repository.claim_due_jobs("next-round-test", limit=10)
+        assert [claim.organization_id for claim in next_turns] == [
+            claim.organization_id for claim in first_turns
+        ]
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(
+                    Organization.id.in_([organization.id for organization in organizations])
+                )
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_concurrent_processes_respect_organization_concurrency_limit(
+    migrated_test_database: URL,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"tenant-cap-process-test-{uuid4()}", max_concurrent_jobs=1)
+    jobs = [
+        _create_due_job(organization.id, sessions)
+        for _ in range(2)
+    ]
+    child_script = """
+import os
+import time
+from pathlib import Path
+from app.config import Settings
+from app.db.engine import create_engine
+from app.db.session import create_session_factory
+from app.repositories.jobs import JobRepository
+
+barrier = Path(os.environ["CLAIM_BARRIER_DIR"])
+ready = barrier / f"ready-{os.environ['CLAIM_PROCESS_ID']}"
+ready.touch()
+deadline = time.monotonic() + 10
+while len(list(barrier.glob("ready-*"))) < 2:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("second claimant did not reach barrier")
+    time.sleep(0.005)
+
+engine = create_engine(Settings.from_env())
+try:
+    repository = JobRepository(create_session_factory(engine))
+    claims = repository.claim_due_jobs(
+        os.environ["CLAIM_PROCESS_ID"],
+        limit=1,
+    )
+    print(f"claimed={len(claims)}")
+finally:
+    engine.dispose()
+"""
+    with tempfile.TemporaryDirectory(prefix="scheduler-tenant-claim-") as directory:
+        processes = []
+        try:
+            for process_id in ("process-a", "process-b"):
+                child_environment = os.environ.copy()
+                child_environment["CLAIM_BARRIER_DIR"] = directory
+                child_environment["CLAIM_PROCESS_ID"] = process_id
+                processes.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", child_script],
+                        cwd=project_root,
+                        env=child_environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                )
+            outputs = [
+                process.communicate(timeout=20)[0]
+                for process in processes
+            ]
+            assert all(process.returncode == 0 for process in processes), outputs
+            assert sum(int(output.strip().split("=")[1]) for output in outputs) == 1
+            running_jobs = [
+                job
+                for job in (JobRepository(sessions).get_by_id(item.id) for item in jobs)
+                if job is not None and job.status == JobStatus.RUNNING
+            ]
+            assert len(running_jobs) == 1
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=5)
+            with engine.begin() as connection:
+                connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+                connection.execute(
+                    delete(Organization).where(Organization.id == organization.id)
+                )
+            engine.dispose()
+
+
+@pytest.mark.integration
+def test_tenant_limits_hold_with_mixed_job_durations(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organizations = [
+        OrganizationService(OrganizationRepository(sessions)).create(
+            f"mixed-duration-test-{index}-{uuid4()}",
+            max_concurrent_jobs=1,
+        )
+        for index in range(3)
+    ]
+    jobs = [
+        _create_due_job(
+            organization.id,
+            sessions,
+            job_type=(
+                "sample.slow"
+                if organization is organizations[0] and index == 0
+                else "sample.success"
+            ),
+        )
+        for organization in organizations
+        for index in range(2)
+    ]
+    repository = JobRepository(sessions)
+    try:
+        first_batch = repository.claim_due_jobs("mixed-duration-test", limit=10)
+        assert len(first_batch) == len(organizations)
+        assert len({claim.organization_id for claim in first_batch}) == len(organizations)
+
+        long_running_claim = next(
+            claim
+            for claim in first_batch
+            if claim.organization_id == organizations[0].id
+        )
+        short_running_claims = [
+            claim
+            for claim in first_batch
+            if claim.organization_id in {item.id for item in organizations[1:]}
+        ]
+        assert long_running_claim.job_type == "sample.slow"
+        assert repository.start_claim(long_running_claim) is not None
+        for claim in short_running_claims:
+            assert claim.job_type == "sample.success"
+            assert repository.start_claim(claim) is not None
+            assert repository.complete_claim(claim)
+
+        short_tenant_turns = repository.claim_due_jobs(
+            "short-tenant-turns",
+            limit=10,
+        )
+        assert {
+            claim.organization_id for claim in short_tenant_turns
+        } == {organization.id for organization in organizations[1:]}
+        assert all(
+            claim.organization_id != organizations[0].id
+            for claim in short_tenant_turns
+        )
+        for claim in short_tenant_turns:
+            assert repository.start_claim(claim) is not None
+            assert repository.complete_claim(claim)
+        assert repository.complete_claim(long_running_claim)
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(
+                    Organization.id.in_([organization.id for organization in organizations])
+                )
             )
         engine.dispose()
 
