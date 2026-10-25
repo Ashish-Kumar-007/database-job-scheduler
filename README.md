@@ -1,9 +1,9 @@
 # Database-Backed Job Scheduler
 
-This repository currently contains the project foundation only: validated
-PostgreSQL connection settings, a SQLAlchemy engine/session factory, a database
-health check, and a local PostgreSQL Compose service. Domain models and
-migrations are intentionally deferred until the foundation is reviewed.
+This repository currently provides validated PostgreSQL connection settings,
+SQLAlchemy database utilities, a health check, the initial `Organization` and
+`Job` models, and their Alembic migration. Consumers, claim/recovery logic, and
+job execution are not implemented yet.
 
 ## Requirements
 
@@ -38,6 +38,20 @@ The health check executes `SELECT 1`. Configuration requires a SQLAlchemy
 PostgreSQL psycopg URL with host, database, username, and password. Credentials
 are parsed as a URL rather than interpolated into a connection string.
 
+## Database schema
+
+Apply the initial schema migration after PostgreSQL is healthy:
+
+```powershell
+python -m alembic upgrade head
+```
+
+The schema includes tenant/job validation constraints and partial indexes for
+scheduled jobs, retry eligibility, and expired leases. `attempts` counts
+committed claims, including claims later recovered after lease expiry; waiting
+jobs must have an attempt remaining. Timestamps are stored as timezone-aware
+PostgreSQL timestamps.
+
 Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 `docker compose down --volumes` removes the local database volume.
 
@@ -47,5 +61,11 @@ Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 python -m pytest
 ```
 
-There are no database models, migrations, integration tests, worker processes,
-or job execution behavior in this foundation phase.
+The migration can be rendered without a live database for review:
+
+```powershell
+python -m alembic upgrade head --sql
+```
+
+PostgreSQL integration tests, worker processes, atomic claiming, retries, and
+recovery will follow in later implementation phases.
