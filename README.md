@@ -1,9 +1,10 @@
 # Database-Backed Job Scheduler
 
-This repository currently provides validated PostgreSQL connection settings,
-SQLAlchemy database utilities, a health check, the initial `Organization` and
-`Job` models, and their Alembic migration. Consumers, claim/recovery logic, and
-job execution are not implemented yet.
+This repository provides validated PostgreSQL connection settings, SQLAlchemy
+database utilities, the `Organization` and `Job` models and migration, validated
+job submission/retrieval, atomic claims, handler registration, and bounded
+worker execution. The consumer polling loop, recovery scheduler, retry backoff,
+and multi-tenant fairness are not implemented yet.
 
 ## Requirements
 
@@ -62,6 +63,28 @@ PostgreSQL `clock_timestamp()`, locks eligible rows with
 bounded to 100. A claim does not set `started_at`; that timestamp belongs to
 the later worker-start transition. Tenant fairness and concurrency limits are
 not yet enforced by claiming and are deferred to their dedicated phase.
+
+## Phase 4: handlers and worker execution
+
+Register a callable per `job_type` with `HandlerRegistry`. Handlers receive the
+job UUID, JSON payload, organization ID context, and idempotency context. The
+idempotency key is the stable job UUID across attempts; handlers integrating
+external systems must pass that key to a destination that supports
+idempotency. Claim tokens fence database status updates, but cannot undo or
+prevent duplicate external side effects.
+
+`WorkerPool` uses a bounded thread pool and rejects dispatch when all worker
+slots are occupied rather than building an unbounded local queue. Before
+calling a handler, it verifies and records the claim start using the current
+lease token. Completion and failure updates require the same token and an
+unexpired lease. Handler failures are recorded and immediately made retryable
+while attempts remain; otherwise they become terminal. Exponential backoff
+and recovery are deferred to later phases. Worker sessions are not shared:
+each repository operation opens its own session/transaction.
+
+Sample handlers for deterministic success, configurable delay, and controlled
+failure are in `app/handlers/sample.py`. A worker pool can be used directly by
+application code; the consumer process/polling loop is a later phase.
 
 Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 `docker compose down --volumes` removes the local database volume.

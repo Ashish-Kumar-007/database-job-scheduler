@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models import Job, JobStatus, Organization
@@ -112,6 +112,82 @@ class JobRepository:
             session.flush()
 
         return claims
+
+    def start_claim(self, claim: JobClaim) -> bool:
+        with self._session_factory.begin() as session:
+            result = session.execute(
+                update(Job)
+                .where(
+                    Job.id == claim.job_id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.locked_by == claim.owner,
+                    Job.claim_token == claim.claim_token,
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .values(
+                    started_at=func.clock_timestamp(),
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+        return result.rowcount == 1
+
+    def complete_claim(self, claim: JobClaim) -> bool:
+        with self._session_factory.begin() as session:
+            result = session.execute(
+                update(Job)
+                .where(
+                    Job.id == claim.job_id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.locked_by == claim.owner,
+                    Job.claim_token == claim.claim_token,
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .values(
+                    status=JobStatus.COMPLETED,
+                    locked_by=None,
+                    claim_token=None,
+                    lease_expires_at=None,
+                    next_attempt_at=None,
+                    completed_at=func.clock_timestamp(),
+                    updated_at=func.clock_timestamp(),
+                )
+            )
+        return result.rowcount == 1
+
+    def fail_claim(self, claim: JobClaim, error_message: str) -> JobStatus | None:
+        if not isinstance(error_message, str) or not error_message.strip():
+            raise InputValidationError("error_message must be a non-empty string")
+        terminal_status = case(
+            (Job.attempts < Job.max_attempts, JobStatus.RETRY_WAIT),
+            else_=JobStatus.FAILED,
+        )
+        retry_at = case(
+            (Job.attempts < Job.max_attempts, func.clock_timestamp()),
+            else_=None,
+        )
+        with self._session_factory.begin() as session:
+            result = session.execute(
+                update(Job)
+                .where(
+                    Job.id == claim.job_id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.locked_by == claim.owner,
+                    Job.claim_token == claim.claim_token,
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .values(
+                    status=terminal_status,
+                    locked_by=None,
+                    claim_token=None,
+                    lease_expires_at=None,
+                    next_attempt_at=retry_at,
+                    last_error=error_message[:4000],
+                    updated_at=func.clock_timestamp(),
+                )
+                .returning(Job.status)
+            )
+            status = result.scalar_one_or_none()
+        return status
 
     def get_by_id(self, job_id: UUID) -> Job | None:
         if not isinstance(job_id, UUID):

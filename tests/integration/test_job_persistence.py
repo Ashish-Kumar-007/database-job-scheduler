@@ -268,3 +268,99 @@ def test_concurrent_claimers_cannot_both_claim_the_same_job(
                 delete(Organization).where(Organization.id == organization.id)
             )
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_claim_completion_and_stale_token_rejection(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"completion-test-{uuid4()}", max_concurrent_jobs=1)
+    job = _create_due_job(organization.id, sessions)
+    repository = JobRepository(sessions)
+    try:
+        claim = next(
+            claim
+            for claim in repository.claim_due_jobs("worker-completion")
+            if claim.job_id == job.id
+        )
+
+        assert repository.start_claim(claim)
+        persisted_started = repository.get_by_id(job.id)
+        assert persisted_started is not None
+        assert persisted_started.started_at is not None
+        assert repository.complete_claim(claim)
+        assert not repository.complete_claim(claim)
+
+        completed_job = repository.get_by_id(job.id)
+        assert completed_job is not None
+        assert completed_job.status == JobStatus.COMPLETED
+        assert completed_job.completed_at is not None
+        assert completed_job.locked_by is None
+        assert completed_job.claim_token is None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_failure_is_retryable_then_terminal_after_attempt_limit(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"failure-test-{uuid4()}", max_concurrent_jobs=1)
+    job = JobService(JobRepository(sessions)).submit(
+        organization_id=organization.id,
+        job_type="test.failure",
+        payload={},
+        scheduled_at=datetime.now(UTC),
+        max_attempts=2,
+    )
+    repository = JobRepository(sessions)
+    try:
+        first_claim = next(
+            claim
+            for claim in repository.claim_due_jobs("worker-failure")
+            if claim.job_id == job.id
+        )
+        assert repository.start_claim(first_claim)
+        assert repository.fail_claim(first_claim, "first attempt failed") == (
+            JobStatus.RETRY_WAIT
+        )
+        assert repository.fail_claim(first_claim, "stale failure") is None
+
+        second_claim = next(
+            claim
+            for claim in repository.claim_due_jobs("worker-retry")
+            if claim.job_id == job.id
+        )
+        assert second_claim.claim_token != first_claim.claim_token
+        assert second_claim.attempts == 2
+        assert repository.start_claim(second_claim)
+        assert repository.fail_claim(second_claim, "second attempt failed") == (
+            JobStatus.FAILED
+        )
+
+        failed_job = repository.get_by_id(job.id)
+        assert failed_job is not None
+        assert failed_job.status == JobStatus.FAILED
+        assert failed_job.last_error == "second attempt failed"
+        assert failed_job.claim_token is None
+        assert failed_job.next_attempt_at is None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
