@@ -22,10 +22,16 @@ from app.services.jobs import JobService
 from app.services.organizations import OrganizationService
 
 
-def _create_due_job(organization_id, sessions, *, scheduled_at=None):
+def _create_due_job(
+    organization_id,
+    sessions,
+    *,
+    scheduled_at=None,
+    job_type="test.claim",
+):
     return JobService(JobRepository(sessions)).submit(
         organization_id=organization_id,
-        job_type="test.claim",
+        job_type=job_type,
         payload={"marker": str(uuid4())},
         scheduled_at=scheduled_at or datetime.now(UTC),
         max_attempts=3,
@@ -360,6 +366,146 @@ def test_failure_is_retryable_then_terminal_after_attempt_limit(
     finally:
         with engine.begin() as connection:
             connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_two_consumer_processes_execute_distinct_jobs(
+    migrated_test_database: URL,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"process-consumer-test-{uuid4()}", max_concurrent_jobs=2)
+    jobs = [
+        _create_due_job(organization.id, sessions, job_type="sample.slow")
+        for _ in range(2)
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DATABASE_URL": migrated_test_database.render_as_string(
+                hide_password=False
+            ),
+            "WORKER_CONCURRENCY": "1",
+            "CLAIM_BATCH_SIZE": "1",
+            "POLL_INTERVAL_SECONDS": "0.01",
+            "LEASE_SECONDS": "30",
+            "CONSUMER_ID": "",
+        }
+    )
+    processes = []
+    try:
+        for _ in range(2):
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "app.consumers",
+                        "--max-completed",
+                        "1",
+                    ],
+                    cwd=project_root,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+
+        outputs = []
+        consumer_ids = set()
+        for process in processes:
+            output, _ = process.communicate(timeout=15)
+            outputs.append(output)
+            assert process.returncode == 0, output
+            stopped_line = next(
+                line
+                for line in output.splitlines()
+                if "Consumer " in line and " stopped " in line
+            )
+            consumer_id = stopped_line.split("Consumer ", 1)[1].split(" stopped ", 1)[0]
+            consumer_ids.add(consumer_id)
+            assert "completed=1" in stopped_line
+
+        assert all("Job execution finished" in output for output in outputs)
+        assert len(consumer_ids) == 2
+        persisted = [JobRepository(sessions).get_by_id(job.id) for job in jobs]
+        assert all(
+            job is not None and job.status == JobStatus.COMPLETED
+            for job in persisted
+        )
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_consumer_worker_capacity_bounds_claimed_batch(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"worker-capacity-test-{uuid4()}", max_concurrent_jobs=3)
+    jobs = [
+        _create_due_job(organization.id, sessions, job_type="sample.slow")
+        for _ in range(3)
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DATABASE_URL": migrated_test_database.render_as_string(
+                hide_password=False
+            ),
+            "WORKER_CONCURRENCY": "2",
+            "CLAIM_BATCH_SIZE": "10",
+            "POLL_INTERVAL_SECONDS": "0.01",
+            "LEASE_SECONDS": "30",
+            "CONSUMER_ID": f"capacity-test-{uuid4()}",
+        }
+    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "app.consumers",
+                "--max-completed",
+                "3",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert "claimed=3 completed=3" in result.stdout + result.stderr
+        persisted = [JobRepository(sessions).get_by_id(job.id) for job in jobs]
+        assert all(
+            job is not None and job.status == JobStatus.COMPLETED
+            for job in persisted
+        )
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
             connection.execute(
                 delete(Organization).where(Organization.id == organization.id)
             )

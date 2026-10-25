@@ -18,6 +18,9 @@ dev = [
     "pytest>=8.0,<9.0",
 ]
 
+[project.scripts]
+scheduler-consumer = "app.consumers.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["app*"]
 

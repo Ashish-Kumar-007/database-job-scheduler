@@ -2,9 +2,9 @@
 
 This repository provides validated PostgreSQL connection settings, SQLAlchemy
 database utilities, the `Organization` and `Job` models and migration, validated
-job submission/retrieval, atomic claims, handler registration, and bounded
-worker execution. The consumer polling loop, recovery scheduler, retry backoff,
-and multi-tenant fairness are not implemented yet.
+job submission/retrieval, atomic claims, handler registration, bounded worker
+execution, and an independent consumer polling process. Lease recovery,
+retry backoff, and multi-tenant fairness are not implemented yet.
 
 ## Requirements
 
@@ -53,7 +53,7 @@ committed claims, including claims later recovered after lease expiry; waiting
 jobs must have an attempt remaining. Timestamps are stored as timezone-aware
 PostgreSQL timestamps.
 
-## Phase 3: atomic claims
+## Atomic claims
 
 `JobRepository.claim_due_jobs(owner, limit, lease_seconds)` claims only due
 `scheduled` jobs and due `retry_wait` jobs. It checks eligibility against
@@ -64,7 +64,7 @@ bounded to 100. A claim does not set `started_at`; that timestamp belongs to
 the later worker-start transition. Tenant fairness and concurrency limits are
 not yet enforced by claiming and are deferred to their dedicated phase.
 
-## Phase 4: handlers and worker execution
+## Handlers and worker execution
 
 Register a callable per `job_type` with `HandlerRegistry`. Handlers receive the
 job UUID, JSON payload, organization ID context, and idempotency context. The
@@ -83,8 +83,45 @@ and recovery are deferred to later phases. Worker sessions are not shared:
 each repository operation opens its own session/transaction.
 
 Sample handlers for deterministic success, configurable delay, and controlled
-failure are in `app/handlers/sample.py`. A worker pool can be used directly by
-application code; the consumer process/polling loop is a later phase.
+failure are in `app/handlers/sample.py`. Worker threads use independent
+repository sessions; no SQLAlchemy session is passed to a handler.
+
+## Run consumer processes
+
+After installing the project and applying migrations, start a consumer in each
+PowerShell terminal:
+
+```powershell
+python -m app.consumers
+```
+
+Each process has an independent database engine/session factory, consumer
+identity, and bounded worker pool. Set `WORKER_CONCURRENCY`,
+`POLL_INTERVAL_SECONDS`, `CLAIM_BATCH_SIZE`, `LEASE_SECONDS`, and
+`SHUTDOWN_GRACE_SECONDS` in the environment or `.env`-derived environment before
+starting it. `CLAIM_BATCH_SIZE` is additionally capped to currently available
+worker slots. Press Ctrl+C to stop polling and drain in-flight handlers.
+
+For a bounded run or process-level smoke test, pass `--max-completed N`. The
+CLI registers `sample.success`, `sample.slow`, and `sample.failure` handlers.
+Database connection failures use capped exponential backoff with jitter.
+Run `python -m app.consumers` in two or three terminals to start independent
+processes. Leave `CONSUMER_ID` empty so each derives a unique
+hostname/process/random identity. Logs include that identity, claimed job IDs,
+outcomes, and a stop summary. Claiming is capped by both configured batch size
+and currently free worker slots, so the consumer does not intentionally
+prefetch work beyond its local execution capacity.
+
+The sample `.env` values are not loaded implicitly. In each PowerShell
+terminal, export the entries before starting the consumer:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object {
+    $name, $value = $_ -split '=', 2
+    Set-Item -Path "Env:$name" -Value $value
+}
+python -m app.consumers
+```
 
 Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 `docker compose down --volumes` removes the local database volume.
@@ -113,5 +150,5 @@ migration can be rendered without a live database for review:
 python -m alembic upgrade head --sql
 ```
 
-Consumer processes, atomic claiming, retries, recovery, and broader PostgreSQL
-integration coverage will follow in later implementation phases.
+Lease recovery, exponential retry backoff, tenant fairness, and broader
+PostgreSQL integration coverage remain for later implementation phases.
