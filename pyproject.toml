@@ -23,3 +23,6 @@ include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: requires a dedicated PostgreSQL test database",
+]

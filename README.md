@@ -61,11 +61,23 @@ Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 python -m pytest
 ```
 
-The migration can be rendered without a live database for review:
+The PostgreSQL persistence test uses a separate database URL, applies pending
+migrations, and verifies that records remain available to a fresh application
+process. Point `TEST_DATABASE_URL` at a
+dedicated test database; do not point it at a database containing unrelated
+data:
+
+```powershell
+$env:TEST_DATABASE_URL = "postgresql+psycopg://scheduler:local-development-only@localhost:5432/scheduler_test"
+python -m pytest
+```
+
+Without `TEST_DATABASE_URL`, the PostgreSQL persistence test is skipped. The
+migration can be rendered without a live database for review:
 
 ```powershell
 python -m alembic upgrade head --sql
 ```
 
-PostgreSQL integration tests, worker processes, atomic claiming, retries, and
-recovery will follow in later implementation phases.
+Consumer processes, atomic claiming, retries, recovery, and broader PostgreSQL
+integration coverage will follow in later implementation phases.
