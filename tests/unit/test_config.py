@@ -20,11 +20,14 @@ def test_settings_parse_escaped_credentials(monkeypatch: pytest.MonkeyPatch) -> 
         port=5432,
         database="jobs",
     )
+    assert settings.db_pool_size == 5
+    assert settings.db_max_overflow == 10
     assert settings.worker_concurrency == 4
     assert settings.claim_batch_size == 10
     assert settings.lease_seconds == 30
     assert settings.poll_interval_seconds == 0.5
     assert settings.consumer_id
+    assert settings.retry_base_seconds == 1
 
 
 def test_settings_accept_configured_consumer_parameters(
@@ -42,6 +45,12 @@ def test_settings_accept_configured_consumer_parameters(
     monkeypatch.setenv("SHUTDOWN_GRACE_SECONDS", "5")
     monkeypatch.setenv("DB_RECONNECT_BASE_SECONDS", "0.25")
     monkeypatch.setenv("DB_RECONNECT_MAX_SECONDS", "4")
+    monkeypatch.setenv("DB_POOL_SIZE", "8")
+    monkeypatch.setenv("DB_MAX_OVERFLOW", "12")
+    monkeypatch.setenv("RETRY_BASE_SECONDS", "0.4")
+    monkeypatch.setenv("RETRY_MAX_SECONDS", "8")
+    monkeypatch.setenv("RETRY_JITTER_RATIO", "0.5")
+    monkeypatch.setenv("LEASE_REAP_INTERVAL_SECONDS", "2")
 
     settings = Settings.from_env()
 
@@ -53,6 +62,12 @@ def test_settings_accept_configured_consumer_parameters(
     assert settings.shutdown_grace_seconds == 5
     assert settings.reconnect_base_seconds == 0.25
     assert settings.reconnect_max_seconds == 4
+    assert settings.db_pool_size == 8
+    assert settings.db_max_overflow == 12
+    assert settings.retry_base_seconds == 0.4
+    assert settings.retry_max_seconds == 8
+    assert settings.retry_jitter_ratio == 0.5
+    assert settings.lease_reap_interval_seconds == 2
 
 
 @pytest.mark.parametrize(
@@ -65,6 +80,12 @@ def test_settings_accept_configured_consumer_parameters(
         ("LEASE_SECONDS", "0"),
         ("DB_RECONNECT_BASE_SECONDS", "16"),
         ("DB_RECONNECT_MAX_SECONDS", "0"),
+        ("DB_POOL_SIZE", "0"),
+        ("DB_MAX_OVERFLOW", "-1"),
+        ("RETRY_BASE_SECONDS", "nan"),
+        ("RETRY_MAX_SECONDS", "0"),
+        ("RETRY_JITTER_RATIO", "1.1"),
+        ("LEASE_REAP_INTERVAL_SECONDS", "0"),
     ],
 )
 def test_settings_reject_invalid_consumer_parameters(

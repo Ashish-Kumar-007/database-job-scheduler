@@ -10,10 +10,12 @@ from app.db.session import create_session_factory
 from app.handlers import HandlerRegistry
 from app.handlers.sample import (
     ControlledFailureHandler,
+    IdempotentSampleHandler,
     SlowSampleHandler,
     SuccessfulSampleHandler,
 )
 from app.repositories.jobs import JobRepository
+from app.services.retry import RetryPolicy
 from app.workers import WorkerPool
 
 
@@ -22,6 +24,7 @@ def _build_handlers() -> HandlerRegistry:
     handlers.register("sample.success", SuccessfulSampleHandler())
     handlers.register("sample.slow", SlowSampleHandler(0.2))
     handlers.register("sample.failure", ControlledFailureHandler())
+    handlers.register("sample.idempotent", IdempotentSampleHandler())
     return handlers
 
 
@@ -58,6 +61,12 @@ def main() -> None:
             repository,
             _build_handlers(),
             max_workers=settings.worker_concurrency,
+            lease_seconds=settings.lease_seconds,
+            retry_policy=RetryPolicy(
+                base_seconds=settings.retry_base_seconds,
+                max_seconds=settings.retry_max_seconds,
+                jitter_ratio=settings.retry_jitter_ratio,
+            ),
         )
         result = Consumer(settings, repository, worker_pool).run(
             stop_event,
@@ -65,13 +74,14 @@ def main() -> None:
         )
         logging.getLogger(__name__).info(
             "Consumer %s stopped claimed=%s completed=%s retry_scheduled=%s "
-            "failed=%s stale=%s",
+            "failed=%s stale=%s recovered=%s",
             settings.consumer_id,
             result.claimed,
             result.completed,
             result.retry_scheduled,
             result.failed,
             result.stale,
+            result.recovered,
             extra={
                 "consumer_id": settings.consumer_id,
                 "claimed": result.claimed,
@@ -79,6 +89,7 @@ def main() -> None:
                 "retry_scheduled": result.retry_scheduled,
                 "failed": result.failed,
                 "stale": result.stale,
+                "recovered": result.recovered,
             },
         )
     finally:

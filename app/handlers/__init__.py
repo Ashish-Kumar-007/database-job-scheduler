@@ -6,10 +6,12 @@ from app.handlers.base import (
     OrganizationContext,
 )
 from app.handlers.registry import HandlerRegistry, UnknownJobType
+from app.handlers.sample import IdempotentSampleHandler
 
 __all__ = [
     "Handler",
     "HandlerRegistry",
+    "IdempotentSampleHandler",
     "IdempotencyContext",
     "OrganizationContext",
     "UnknownJobType",

@@ -1,6 +1,8 @@
 import os
 import subprocess
 import sys
+import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,16 +12,25 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine as sqlalchemy_create_engine, delete
+from sqlalchemy import (
+    create_engine as sqlalchemy_create_engine,
+    delete,
+    func,
+    select,
+    update,
+)
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Job, JobStatus, Organization
+from app.handlers import HandlerRegistry
+from app.handlers.sample import IdempotentSampleHandler
+from app.models import Job, JobStatus, Organization, SampleOperation
 from app.repositories.jobs import JobRepository
 from app.repositories.organizations import OrganizationRepository
 from app.services.errors import OrganizationNotFound
 from app.services.jobs import JobService
 from app.services.organizations import OrganizationService
+from app.workers import ExecutionOutcome, WorkerPool
 
 
 def _create_due_job(
@@ -370,6 +381,220 @@ def test_failure_is_retryable_then_terminal_after_attempt_limit(
                 delete(Organization).where(Organization.id == organization.id)
             )
         engine.dispose()
+
+
+@pytest.mark.integration
+def test_expired_claim_recovery_fences_old_owner_and_exhausts_attempts(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"lease-recovery-test-{uuid4()}", max_concurrent_jobs=1)
+    job = JobService(JobRepository(sessions)).submit(
+        organization_id=organization.id,
+        job_type="test.recovery",
+        payload={},
+        scheduled_at=datetime.now(UTC),
+        max_attempts=2,
+    )
+    repository = JobRepository(sessions)
+    try:
+        first_claim = next(
+            claim
+            for claim in repository.claim_due_jobs(
+                "worker-before-crash",
+                lease_seconds=60,
+            )
+            if claim.job_id == job.id
+        )
+        assert repository.start_claim(first_claim)
+        assert repository.renew_lease(first_claim, lease_seconds=120)
+
+        with engine.begin() as connection:
+            connection.execute(
+                update(Job)
+                .where(Job.id == job.id)
+                .values(
+                    lease_expires_at=func.clock_timestamp()
+                    - func.make_interval(0, 0, 0, 0, 0, 0, 1)
+                )
+            )
+
+        recovered = repository.recover_expired_claims(retry_delay_seconds=0)
+        assert [(item.job_id, item.status) for item in recovered] == [
+            (job.id, JobStatus.RETRY_WAIT)
+        ]
+        assert not repository.complete_claim(first_claim)
+        assert not repository.renew_lease(first_claim, lease_seconds=30)
+
+        second_claim = next(
+            claim
+            for claim in repository.claim_due_jobs("worker-after-crash")
+            if claim.job_id == job.id
+        )
+        assert second_claim.attempts == 2
+        with engine.begin() as connection:
+            connection.execute(
+                update(Job)
+                .where(Job.id == job.id)
+                .values(
+                    lease_expires_at=func.clock_timestamp()
+                    - func.make_interval(0, 0, 0, 0, 0, 0, 1)
+                )
+            )
+
+        exhausted = repository.recover_expired_claims()
+        assert [(item.job_id, item.status) for item in exhausted] == [
+            (job.id, JobStatus.FAILED)
+        ]
+        failed = repository.get_by_id(job.id)
+        assert failed is not None
+        assert failed.status == JobStatus.FAILED
+        assert failed.last_error is not None
+        assert "attempt limit exhausted" in failed.last_error
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_killed_consumer_recovers_idempotent_operation_after_restart(
+    migrated_test_database: URL,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"crash-recovery-test-{uuid4()}", max_concurrent_jobs=1)
+    job = JobService(JobRepository(sessions)).submit(
+        organization_id=organization.id,
+        job_type="sample.idempotent",
+        payload={"operation": "durable"},
+        scheduled_at=datetime.now(UTC),
+        max_attempts=2,
+    )
+    environment = os.environ.copy()
+    environment["DATABASE_URL"] = migrated_test_database.render_as_string(
+        hide_password=False
+    )
+    environment["CRASH_SIGNAL_FILE"] = ""
+    child_script = """
+import os
+import time
+from app.config import Settings
+from app.db.engine import create_engine
+from app.db.session import create_session_factory
+from app.repositories.jobs import JobRepository
+from uuid import UUID
+
+engine = create_engine(Settings.from_env())
+try:
+    repository = JobRepository(create_session_factory(engine))
+    job_id = UUID(os.environ["CRASH_TEST_JOB_ID"])
+    claim = next(
+        claim for claim in repository.claim_due_jobs("crash-test-consumer")
+        if claim.job_id == job_id
+    )
+    assert repository.start_claim(claim)
+    repository.record_sample_operation(
+        job_id,
+        str(job_id),
+        {
+            "job_id": str(job_id),
+            "organization_id": str(claim.organization_id),
+            "payload": claim.payload,
+        },
+    )
+    with open(os.environ["CRASH_SIGNAL_FILE"], "w", encoding="utf-8") as signal:
+        signal.write("side effect committed")
+    time.sleep(120)
+finally:
+    engine.dispose()
+"""
+    with tempfile.TemporaryDirectory(prefix="scheduler-crash-test-") as directory:
+        signal_file = Path(directory) / "claimed.txt"
+        environment["CRASH_SIGNAL_FILE"] = str(signal_file)
+        environment["CRASH_TEST_JOB_ID"] = str(job.id)
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_script],
+            cwd=project_root,
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while not signal_file.exists() and process.poll() is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("child consumer did not reach crash barrier")
+                time.sleep(0.01)
+            assert signal_file.exists()
+            process.terminate()
+            process.wait(timeout=5)
+            assert process.returncode is not None
+
+            repository = JobRepository(sessions)
+            with engine.begin() as connection:
+                connection.execute(
+                    update(Job)
+                    .where(Job.id == job.id)
+                    .values(
+                        lease_expires_at=func.clock_timestamp()
+                        - func.make_interval(0, 0, 0, 0, 0, 0, 1)
+                    )
+                )
+            assert repository.recover_expired_claims(retry_delay_seconds=0)
+
+            retry_claim = next(
+                claim
+                for claim in repository.claim_due_jobs("replacement-consumer")
+                if claim.job_id == job.id
+            )
+            handlers = HandlerRegistry()
+            handlers.register("sample.idempotent", IdempotentSampleHandler())
+            with WorkerPool(
+                repository,
+                handlers,
+                max_workers=1,
+                lease_seconds=30,
+            ) as worker_pool:
+                result = worker_pool.dispatch(retry_claim).result(timeout=10)
+            assert result.outcome == ExecutionOutcome.COMPLETED
+            assert result.result == {
+                "job_id": str(job.id),
+                "organization_id": str(organization.id),
+                "payload": {"operation": "durable"},
+            }
+            with sessions() as session:
+                operations = list(
+                    session.scalars(
+                        select(SampleOperation).where(
+                            SampleOperation.job_id == job.id
+                        )
+                    )
+                )
+            assert len(operations) == 1
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            with engine.begin() as connection:
+                connection.execute(
+                    delete(SampleOperation).where(SampleOperation.job_id == job.id)
+                )
+                connection.execute(delete(Job).where(Job.id == job.id))
+                connection.execute(
+                    delete(Organization).where(Organization.id == organization.id)
+                )
+            engine.dispose()
 
 
 @pytest.mark.integration

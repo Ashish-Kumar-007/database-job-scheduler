@@ -8,3 +8,7 @@ class OrganizationNotFound(LookupError):
 
 class RetryableJobError(RuntimeError):
     """Raised by a handler when its job attempt should be retried."""
+
+
+class PermanentJobError(RuntimeError):
+    """Raised by a handler when a job must fail without another attempt."""

@@ -2,6 +2,7 @@ from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from threading import Event, Lock
 from time import sleep
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -19,7 +20,7 @@ from app.handlers.sample import (
 )
 from app.models import JobStatus
 from app.repositories.jobs import JobClaim
-from app.services.errors import RetryableJobError
+from app.services.errors import PermanentJobError, RetryableJobError
 from app.workers import (
     ExecutionOutcome,
     ExecutionResult,
@@ -38,22 +39,48 @@ class FakeJobRepository:
         self.completed: list[JobClaim] = []
         self.failures: list[tuple[JobClaim, str]] = []
 
-    def start_claim(self, claim: JobClaim) -> bool:
+    def start_claim(self, claim: JobClaim) -> datetime | None:
         if self.start_error is not None:
             error = self.start_error
             self.start_error = None
             raise error
         if self.can_start:
             self.started.append(claim)
-        return self.can_start
+        return datetime.now(UTC) if self.can_start else None
 
     def complete_claim(self, claim: JobClaim) -> bool:
         self.completed.append(claim)
         return self.can_complete
 
-    def fail_claim(self, claim: JobClaim, error_message: str) -> JobStatus | None:
+    def fail_claim(
+        self,
+        claim: JobClaim,
+        error_message: str,
+        *,
+        retryable: bool = True,
+        retry_delay_seconds: float = 0,
+    ) -> JobStatus | None:
         self.failures.append((claim, error_message))
-        return self.failure_status
+        return self.failure_status if retryable else JobStatus.FAILED
+
+    def renew_lease(self, claim: JobClaim, *, lease_seconds: float) -> bool:
+        return True
+
+    def record_sample_operation(
+        self,
+        job_id,
+        idempotency_key: str,
+        result: object,
+    ) -> object:
+        return result
+
+    def recover_expired_claims(
+        self,
+        *,
+        limit: int,
+        retry_delay_seconds: float,
+    ) -> list:
+        return []
 
 
 def make_claim(
@@ -61,6 +88,7 @@ def make_claim(
     *,
     attempts: int = 1,
     max_attempts: int = 3,
+    retry_eligible_at: datetime | None = None,
 ) -> JobClaim:
     now = datetime.now(UTC)
     return JobClaim(
@@ -74,6 +102,7 @@ def make_claim(
         owner="consumer-test",
         claim_token=uuid4(),
         lease_expires_at=now + timedelta(seconds=60),
+        retry_eligible_at=retry_eligible_at,
     )
 
 
@@ -228,8 +257,25 @@ def test_unknown_handler_fails_predictably_and_persists_failure() -> None:
     with WorkerPool(repository, registry, max_workers=1) as pool:
         result = pool.dispatch(make_claim("not.registered")).result(timeout=1)
 
-    assert result.outcome == ExecutionOutcome.RETRY_SCHEDULED
+    assert result.outcome == ExecutionOutcome.FAILED
     assert "UnknownJobType" in repository.failures[0][1]
+
+
+def test_permanent_handler_failure_does_not_schedule_retry() -> None:
+    repository = FakeJobRepository()
+    registry = HandlerRegistry()
+
+    def reject(*args):
+        raise PermanentJobError("invalid payload")
+
+    registry.register("sample.permanent", reject)
+    claim = make_claim("sample.permanent")
+
+    with WorkerPool(repository, registry, max_workers=1) as pool:
+        result = pool.dispatch(claim).result(timeout=1)
+
+    assert result.outcome == ExecutionOutcome.FAILED
+    assert repository.failures == [(claim, "PermanentJobError: invalid payload")]
 
 
 def test_worker_slot_is_released_after_a_handler_failure() -> None:
@@ -244,6 +290,53 @@ def test_worker_slot_is_released_after_a_handler_failure() -> None:
 
     assert failed.outcome == ExecutionOutcome.RETRY_SCHEDULED
     assert succeeded.outcome == ExecutionOutcome.COMPLETED
+
+
+def test_worker_renews_lease_while_handler_is_running() -> None:
+    repository = FakeJobRepository()
+    registry = HandlerRegistry()
+    renewals = []
+
+    def renew_lease(claim: JobClaim, *, lease_seconds: float) -> bool:
+        renewals.append(claim)
+        return True
+
+    repository.renew_lease = renew_lease
+    registry.register("sample.slow", SlowSampleHandler(0.08))
+    claim = make_claim("sample.slow")
+
+    with WorkerPool(
+        repository,
+        registry,
+        max_workers=1,
+        lease_seconds=0.03,
+    ) as pool:
+        result = pool.dispatch(claim).result(timeout=1)
+
+    assert result.outcome == ExecutionOutcome.COMPLETED
+    assert renewals
+
+
+def test_worker_logs_retry_wait_separately_from_initial_schedule_delay() -> None:
+    repository = FakeJobRepository()
+    handlers = HandlerRegistry()
+    handlers.register("sample.success", SuccessfulSampleHandler())
+    claim = make_claim(
+        retry_eligible_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    with patch("app.workers.pool.logger.info") as log_info:
+        with WorkerPool(repository, handlers, max_workers=1) as pool:
+            result = pool.dispatch(claim).result(timeout=1)
+    start_log = next(
+        call
+        for call in log_info.call_args_list
+        if call.args[0].startswith("Job handler started")
+    )
+    extra = start_log.kwargs["extra"]
+    assert result.outcome == ExecutionOutcome.COMPLETED
+    assert extra["scheduling_delay_seconds"] is None
+    assert extra["retry_wait_seconds"] >= 1
 
 
 def test_worker_slot_is_released_after_database_exception() -> None:

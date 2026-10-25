@@ -19,3 +19,15 @@ _Avoid_: Retry count, worker start count
 **Claim**:
 Temporary ownership of a job by one consumer, identified by a unique token and bounded by a lease.
 _Avoid_: Reservation, lock
+
+**Lease**:
+A time-limited period during which a claim remains valid; expiration allows the unfinished job to be recovered but does not prove its previous worker stopped.
+_Avoid_: Lock timeout, execution deadline
+
+**Recovery**:
+Making an unfinished job eligible for another attempt after its claim lease expires.
+_Avoid_: Cancellation, rollback
+
+**Idempotency key**:
+A stable identifier for one logical operation that lets a destination recognize repeated attempts as the same operation.
+_Avoid_: Claim token, attempt identifier

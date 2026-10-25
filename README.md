@@ -1,10 +1,10 @@
 # Database-Backed Job Scheduler
 
-This repository provides validated PostgreSQL connection settings, SQLAlchemy
-database utilities, the `Organization` and `Job` models and migration, validated
-job submission/retrieval, atomic claims, handler registration, bounded worker
-execution, and an independent consumer polling process. Lease recovery,
-retry backoff, and multi-tenant fairness are not implemented yet.
+This repository provides validated PostgreSQL settings, SQLAlchemy models and
+migrations, job submission and retrieval, atomic claims, handler registration,
+bounded worker execution, independent consumer processes, lease renewal and
+recovery, bounded retries, and a durable idempotent sample operation.
+Multi-tenant fair scheduling is not implemented yet.
 
 ## Requirements
 
@@ -41,7 +41,7 @@ are parsed as a URL rather than interpolated into a connection string.
 
 ## Database schema
 
-Apply the initial schema migration after PostgreSQL is healthy:
+Apply the schema migrations after PostgreSQL is healthy:
 
 ```powershell
 python -m alembic upgrade head
@@ -77,14 +77,31 @@ prevent duplicate external side effects.
 slots are occupied rather than building an unbounded local queue. Before
 calling a handler, it verifies and records the claim start using the current
 lease token. Completion and failure updates require the same token and an
-unexpired lease. Handler failures are recorded and immediately made retryable
-while attempts remain; otherwise they become terminal. Exponential backoff
-and recovery are deferred to later phases. Worker sessions are not shared:
-each repository operation opens its own session/transaction.
+unexpired lease. A separate heartbeat renews active leases every third of the
+configured lease duration. Consumers periodically recover expired claims with
+`FOR UPDATE SKIP LOCKED`; recovery clears stale ownership and either schedules
+a retry or marks the job failed when attempts are exhausted. Attempts count
+committed claims, so a worker killed after claim still consumes an attempt.
+The first execution records `started_at - scheduled_at` as scheduling delay;
+retry executions instead record elapsed time since their `next_attempt_at`,
+keeping retry waiting distinct from the original scheduling delay.
 
-Sample handlers for deterministic success, configurable delay, and controlled
-failure are in `app/handlers/sample.py`. Worker threads use independent
-repository sessions; no SQLAlchemy session is passed to a handler.
+Retryable handler failures use capped exponential backoff with configurable
+jitter (`RETRY_BASE_SECONDS`, `RETRY_MAX_SECONDS`, and
+`RETRY_JITTER_RATIO`). `RetryableJobError` requests a retry;
+`PermanentJobError` and an unregistered handler type fail immediately.
+Unclassified handler exceptions are considered retryable. Expired-lease
+recovery waits the configured base retry delay. Worker sessions are not shared:
+each repository operation opens its own session and transaction.
+
+The `sample.idempotent` handler demonstrates a durable sample side effect in
+the `sample_operations` table, uniquely keyed by job UUID. Repeated attempts
+return the first stored result instead of inserting a second operation. This
+guarantee applies only to effects committed through that database ledger. For
+external APIs, pass the stable job UUID as the destination's idempotency key
+when supported. A database claim token fences scheduler state changes but
+cannot cancel a stale worker or make an arbitrary external effect exactly
+once; a crash after an external effect and before completion can repeat it.
 
 ## Run consumer processes
 
@@ -99,11 +116,17 @@ Each process has an independent database engine/session factory, consumer
 identity, and bounded worker pool. Set `WORKER_CONCURRENCY`,
 `POLL_INTERVAL_SECONDS`, `CLAIM_BATCH_SIZE`, `LEASE_SECONDS`, and
 `SHUTDOWN_GRACE_SECONDS` in the environment or `.env`-derived environment before
-starting it. `CLAIM_BATCH_SIZE` is additionally capped to currently available
-worker slots. Press Ctrl+C to stop polling and drain in-flight handlers.
+starting it. `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` bound SQLAlchemy connections
+per process; account for the sum across consumer replicas when setting the
+database's connection budget. `RETRY_BASE_SECONDS`, `RETRY_MAX_SECONDS`,
+`RETRY_JITTER_RATIO`, and `LEASE_REAP_INTERVAL_SECONDS` control retry and
+recovery behavior. `CLAIM_BATCH_SIZE` is additionally capped to currently
+available worker slots. Press Ctrl+C to stop polling and drain in-flight
+handlers.
 
 For a bounded run or process-level smoke test, pass `--max-completed N`. The
-CLI registers `sample.success`, `sample.slow`, and `sample.failure` handlers.
+CLI registers `sample.success`, `sample.slow`, `sample.failure`, and
+`sample.idempotent` handlers.
 Database connection failures use capped exponential backoff with jitter.
 Run `python -m app.consumers` in two or three terminals to start independent
 processes. Leave `CONSUMER_ID` empty so each derives a unique
@@ -132,9 +155,9 @@ Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 python -m pytest
 ```
 
-The PostgreSQL persistence test uses a separate database URL, applies pending
-migrations, and verifies that records remain available to a fresh application
-process. Point `TEST_DATABASE_URL` at a
+PostgreSQL integration tests use a separate database URL, apply pending
+migrations, and verify persistence, concurrent claiming, lease recovery,
+process crashes, and idempotent operations. Point `TEST_DATABASE_URL` at a
 dedicated test database; do not point it at a database containing unrelated
 data:
 
@@ -150,5 +173,6 @@ migration can be rendered without a live database for review:
 python -m alembic upgrade head --sql
 ```
 
-Lease recovery, exponential retry backoff, tenant fairness, and broader
-PostgreSQL integration coverage remain for later implementation phases.
+PostgreSQL integration tests cover claims, leases, recovery, retries, process
+crashes, and idempotent sample operations when `TEST_DATABASE_URL` points to a
+dedicated PostgreSQL database. Tenant fairness remains for a later phase.

@@ -1,6 +1,7 @@
 import os
 import socket
 from dataclasses import dataclass
+from math import isfinite
 from uuid import uuid4
 
 from sqlalchemy.engine import URL, make_url
@@ -22,7 +23,7 @@ def _float_setting(
         value = float(raw_value)
     except ValueError as error:
         raise ConfigurationError(f"{name} must be a number") from error
-    if value < minimum or not value < float("inf"):
+    if value < minimum or not isfinite(value):
         raise ConfigurationError(f"{name} must be at least {minimum}")
     return value
 
@@ -41,6 +42,8 @@ def _int_setting(name: str, default: int, *, minimum: int, maximum: int) -> int:
 @dataclass(frozen=True)
 class Settings:
     database_url: URL
+    db_pool_size: int
+    db_max_overflow: int
     consumer_id: str
     worker_concurrency: int
     poll_interval_seconds: float
@@ -49,6 +52,10 @@ class Settings:
     shutdown_grace_seconds: float
     reconnect_base_seconds: float
     reconnect_max_seconds: float
+    retry_base_seconds: float
+    retry_max_seconds: float
+    retry_jitter_ratio: float
+    lease_reap_interval_seconds: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -96,8 +103,34 @@ class Settings:
                 "DB_RECONNECT_MAX_SECONDS must be at least DB_RECONNECT_BASE_SECONDS"
             )
 
+        retry_base = _float_setting("RETRY_BASE_SECONDS", 1.0, minimum=0.01)
+        retry_max = _float_setting("RETRY_MAX_SECONDS", 60.0, minimum=0.01)
+        if retry_max < retry_base:
+            raise ConfigurationError(
+                "RETRY_MAX_SECONDS must be at least RETRY_BASE_SECONDS"
+            )
+        retry_jitter_ratio = _float_setting(
+            "RETRY_JITTER_RATIO",
+            0.25,
+            minimum=0.0,
+        )
+        if retry_jitter_ratio > 1:
+            raise ConfigurationError("RETRY_JITTER_RATIO must not exceed 1")
+
         return cls(
             database_url=database_url,
+            db_pool_size=_int_setting(
+                "DB_POOL_SIZE",
+                5,
+                minimum=1,
+                maximum=100,
+            ),
+            db_max_overflow=_int_setting(
+                "DB_MAX_OVERFLOW",
+                10,
+                minimum=0,
+                maximum=100,
+            ),
             consumer_id=consumer_id,
             worker_concurrency=_int_setting(
                 "WORKER_CONCURRENCY",
@@ -127,4 +160,12 @@ class Settings:
             ),
             reconnect_base_seconds=reconnect_base,
             reconnect_max_seconds=reconnect_max,
+            retry_base_seconds=retry_base,
+            retry_max_seconds=retry_max,
+            retry_jitter_ratio=retry_jitter_ratio,
+            lease_reap_interval_seconds=_float_setting(
+                "LEASE_REAP_INTERVAL_SECONDS",
+                5.0,
+                minimum=0.01,
+            ),
         )

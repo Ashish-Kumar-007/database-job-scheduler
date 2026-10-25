@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 from uuid import UUID
 
 
@@ -12,6 +12,12 @@ class OrganizationContext:
 class IdempotencyContext:
     key: str
     attempt: int
+    _record_once: Callable[[str, object], object] | None = None
+
+    def record_once(self, result: object) -> object:
+        if self._record_once is None:
+            raise RuntimeError("No durable idempotency store is configured")
+        return self._record_once(self.key, result)
 
 
 class Handler(Protocol):

@@ -28,6 +28,8 @@ def make_settings(
             host="localhost",
             database="test",
         ),
+        db_pool_size=5,
+        db_max_overflow=10,
         consumer_id="test-consumer",
         worker_concurrency=worker_concurrency,
         poll_interval_seconds=poll_interval_seconds,
@@ -36,6 +38,10 @@ def make_settings(
         shutdown_grace_seconds=shutdown_grace_seconds,
         reconnect_base_seconds=0.01,
         reconnect_max_seconds=0.02,
+        retry_base_seconds=0.01,
+        retry_max_seconds=1,
+        retry_jitter_ratio=0,
+        lease_reap_interval_seconds=5,
     )
 
 

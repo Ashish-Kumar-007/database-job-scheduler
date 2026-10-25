@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.models import Job, JobStatus, Organization
+from app.models import Job, JobStatus, Organization, SampleOperation
 from app.services.errors import InputValidationError, OrganizationNotFound
 from app.services.inputs import JobSubmission
 
@@ -24,6 +25,15 @@ class JobClaim:
     owner: str
     claim_token: UUID
     lease_expires_at: datetime
+    retry_eligible_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class RecoveredClaim:
+    job_id: UUID
+    organization_id: UUID
+    attempts: int
+    status: JobStatus
 
 
 class JobRepository:
@@ -89,6 +99,11 @@ class JobRepository:
             for job in jobs:
                 token = uuid4()
                 lease_expires_at = database_now + timedelta(seconds=lease_seconds)
+                retry_eligible_at = (
+                    job.next_attempt_at
+                    if job.status == JobStatus.RETRY_WAIT
+                    else None
+                )
                 job.status = JobStatus.RUNNING
                 job.locked_by = owner
                 job.claim_token = token
@@ -107,13 +122,14 @@ class JobRepository:
                         owner=owner,
                         claim_token=token,
                         lease_expires_at=lease_expires_at,
+                        retry_eligible_at=retry_eligible_at,
                     )
                 )
             session.flush()
 
         return claims
 
-    def start_claim(self, claim: JobClaim) -> bool:
+    def start_claim(self, claim: JobClaim) -> datetime | None:
         with self._session_factory.begin() as session:
             result = session.execute(
                 update(Job)
@@ -128,8 +144,9 @@ class JobRepository:
                     started_at=func.clock_timestamp(),
                     updated_at=func.clock_timestamp(),
                 )
+                .returning(Job.started_at)
             )
-        return result.rowcount == 1
+            return result.scalar_one_or_none()
 
     def complete_claim(self, claim: JobClaim) -> bool:
         with self._session_factory.begin() as session:
@@ -154,17 +171,8 @@ class JobRepository:
             )
         return result.rowcount == 1
 
-    def fail_claim(self, claim: JobClaim, error_message: str) -> JobStatus | None:
-        if not isinstance(error_message, str) or not error_message.strip():
-            raise InputValidationError("error_message must be a non-empty string")
-        terminal_status = case(
-            (Job.attempts < Job.max_attempts, JobStatus.RETRY_WAIT),
-            else_=JobStatus.FAILED,
-        )
-        retry_at = case(
-            (Job.attempts < Job.max_attempts, func.clock_timestamp()),
-            else_=None,
-        )
+    def renew_lease(self, claim: JobClaim, *, lease_seconds: float) -> bool:
+        self._validate_lease_seconds(lease_seconds)
         with self._session_factory.begin() as session:
             result = session.execute(
                 update(Job)
@@ -176,18 +184,155 @@ class JobRepository:
                     Job.lease_expires_at > func.clock_timestamp(),
                 )
                 .values(
-                    status=terminal_status,
-                    locked_by=None,
-                    claim_token=None,
-                    lease_expires_at=None,
-                    next_attempt_at=retry_at,
-                    last_error=error_message[:4000],
+                    lease_expires_at=func.clock_timestamp()
+                    + func.make_interval(0, 0, 0, 0, 0, 0, lease_seconds),
                     updated_at=func.clock_timestamp(),
                 )
-                .returning(Job.status)
             )
-            status = result.scalar_one_or_none()
+        return result.rowcount == 1
+
+    def fail_claim(
+        self,
+        claim: JobClaim,
+        error_message: str,
+        *,
+        retryable: bool = True,
+        retry_delay_seconds: float = 0,
+    ) -> JobStatus | None:
+        if not isinstance(error_message, str) or not error_message.strip():
+            raise InputValidationError("error_message must be a non-empty string")
+        self._validate_retry_delay(retry_delay_seconds)
+        with self._session_factory.begin() as session:
+            job = session.scalar(
+                select(Job)
+                .where(
+                    Job.id == claim.job_id,
+                    Job.status == JobStatus.RUNNING,
+                    Job.locked_by == claim.owner,
+                    Job.claim_token == claim.claim_token,
+                    Job.lease_expires_at > func.clock_timestamp(),
+                )
+                .with_for_update()
+            )
+            if job is None:
+                return None
+            should_retry = retryable and job.attempts < job.max_attempts
+            job.status = JobStatus.RETRY_WAIT if should_retry else JobStatus.FAILED
+            job.locked_by = None
+            job.claim_token = None
+            job.lease_expires_at = None
+            job.next_attempt_at = (
+                func.clock_timestamp()
+                + func.make_interval(0, 0, 0, 0, 0, 0, retry_delay_seconds)
+                if should_retry
+                else None
+            )
+            job.last_error = error_message[:4000]
+            job.updated_at = func.clock_timestamp()
+            session.flush()
+            status = job.status
         return status
+
+    def recover_expired_claims(
+        self,
+        *,
+        limit: int = 100,
+        retry_delay_seconds: float = 0,
+    ) -> list[RecoveredClaim]:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= self.MAX_CLAIM_BATCH_SIZE
+        ):
+            raise InputValidationError(
+                f"limit must be an integer between 1 and {self.MAX_CLAIM_BATCH_SIZE}"
+            )
+        self._validate_retry_delay(retry_delay_seconds)
+        recovered: list[RecoveredClaim] = []
+        with self._session_factory.begin() as session:
+            expired_jobs = list(
+                session.scalars(
+                    select(Job)
+                    .where(
+                        Job.status == JobStatus.RUNNING,
+                        Job.lease_expires_at <= func.clock_timestamp(),
+                    )
+                    .order_by(Job.lease_expires_at, Job.id)
+                    .limit(limit)
+                    .with_for_update(skip_locked=True, of=Job)
+                )
+            )
+            for job in expired_jobs:
+                can_retry = job.attempts < job.max_attempts
+                job.status = (
+                    JobStatus.RETRY_WAIT if can_retry else JobStatus.FAILED
+                )
+                job.locked_by = None
+                job.claim_token = None
+                job.lease_expires_at = None
+                job.next_attempt_at = (
+                    func.clock_timestamp()
+                    + func.make_interval(0, 0, 0, 0, 0, 0, retry_delay_seconds)
+                    if can_retry
+                    else None
+                )
+                job.last_error = (
+                    f"Lease expired for attempt {job.attempts}; "
+                    + (
+                        "retry scheduled"
+                        if can_retry
+                        else "attempt limit exhausted"
+                    )
+                )
+                job.updated_at = func.clock_timestamp()
+                recovered.append(
+                    RecoveredClaim(
+                        job_id=job.id,
+                        organization_id=job.organization_id,
+                        attempts=job.attempts,
+                        status=job.status,
+                    )
+                )
+            session.flush()
+        return recovered
+
+    def record_sample_operation(
+        self,
+        job_id: UUID,
+        idempotency_key: str,
+        result: object,
+    ) -> object:
+        if not isinstance(job_id, UUID):
+            raise InputValidationError("job_id must be a UUID")
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key) > 255
+        ):
+            raise InputValidationError(
+                "idempotency_key must contain 1 to 255 characters"
+            )
+        with self._session_factory.begin() as session:
+            inserted = session.scalar(
+                insert(SampleOperation)
+                .values(
+                    job_id=job_id,
+                    idempotency_key=idempotency_key,
+                    result=result,
+                )
+                .on_conflict_do_nothing()
+                .returning(SampleOperation.result)
+            )
+            if inserted is not None:
+                return inserted
+            existing = session.scalar(
+                select(SampleOperation).where(SampleOperation.job_id == job_id)
+            )
+            if existing is None or existing.idempotency_key != idempotency_key:
+                raise RuntimeError(
+                    "Idempotency key is already associated with another operation"
+                )
+            return existing.result
 
     def get_by_id(self, job_id: UUID) -> Job | None:
         if not isinstance(job_id, UUID):
@@ -259,3 +404,25 @@ class JobRepository:
             or lease_seconds <= 0
         ):
             raise InputValidationError("lease_seconds must be a positive finite number")
+
+    @staticmethod
+    def _validate_lease_seconds(lease_seconds: float) -> None:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(lease_seconds)
+            or lease_seconds <= 0
+        ):
+            raise InputValidationError("lease_seconds must be a positive finite number")
+
+    @staticmethod
+    def _validate_retry_delay(retry_delay_seconds: float) -> None:
+        if (
+            isinstance(retry_delay_seconds, bool)
+            or not isinstance(retry_delay_seconds, (int, float))
+            or not math.isfinite(retry_delay_seconds)
+            or retry_delay_seconds < 0
+        ):
+            raise InputValidationError(
+                "retry_delay_seconds must be a non-negative finite number"
+            )

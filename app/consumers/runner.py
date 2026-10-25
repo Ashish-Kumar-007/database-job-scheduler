@@ -3,6 +3,7 @@ import random
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 from threading import Event
+from time import monotonic
 
 from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as PoolTimeoutError
 
@@ -20,6 +21,7 @@ class ConsumerResult:
     retry_scheduled: int
     failed: int
     stale: int
+    recovered: int
 
 
 class Consumer:
@@ -53,8 +55,10 @@ class Consumer:
             "retry_scheduled": 0,
             "failed": 0,
             "stale": 0,
+            "recovered": 0,
         }
         consecutive_database_errors = 0
+        next_recovery_at = 0.0
         try:
             while not stop_event.is_set():
                 self._collect_finished(pending, totals)
@@ -72,6 +76,30 @@ class Consumer:
                         available_slots,
                     )
                     try:
+                        if monotonic() >= next_recovery_at:
+                            recovered = self._repository.recover_expired_claims(
+                                limit=min(
+                                    self._settings.claim_batch_size,
+                                    JobRepository.MAX_CLAIM_BATCH_SIZE,
+                                ),
+                                retry_delay_seconds=self._settings.retry_base_seconds,
+                            )
+                            totals["recovered"] += len(recovered)
+                            for item in recovered:
+                                logger.warning(
+                                    "Expired job claim recovered",
+                                    extra={
+                                        "job_id": str(item.job_id),
+                                        "organization_id": str(item.organization_id),
+                                        "consumer_id": self._settings.consumer_id,
+                                        "attempt": item.attempts,
+                                        "status": item.status.value,
+                                    },
+                                )
+                            next_recovery_at = (
+                                monotonic()
+                                + self._settings.lease_reap_interval_seconds
+                            )
                         claims = self._repository.claim_due_jobs(
                             self._settings.consumer_id,
                             limit=claim_limit,

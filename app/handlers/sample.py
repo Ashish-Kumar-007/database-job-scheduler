@@ -63,3 +63,20 @@ class ControlledFailureHandler:
         idempotency: IdempotencyContext,
     ) -> None:
         raise RetryableJobError(self._message)
+
+
+class IdempotentSampleHandler:
+    def __call__(
+        self,
+        job_id: UUID,
+        payload: object,
+        organization: OrganizationContext,
+        idempotency: IdempotencyContext,
+    ) -> object:
+        return idempotency.record_once(
+            {
+                "job_id": str(job_id),
+                "organization_id": str(organization.organization_id),
+                "payload": payload,
+            }
+        )
