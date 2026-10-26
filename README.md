@@ -175,7 +175,9 @@ python -m pytest
 
 PostgreSQL integration tests use a separate database URL, apply pending
 migrations, and verify persistence, concurrent claiming, tenant fairness,
-lease recovery, process crashes, and idempotent operations. Point
+database-time scheduling boundaries, retry exhaustion, terminal-state
+non-reclaimability, transient database-failure recovery, process crashes and
+restarts, stale-claim fencing, and idempotent operations. Point
 `TEST_DATABASE_URL` at a dedicated test database; do not point it at a
 database containing unrelated data:
 
@@ -192,5 +194,5 @@ python -m alembic upgrade head --sql
 ```
 
 PostgreSQL integration tests cover claims, leases, recovery, retries, process
-crashes, tenant fairness and idempotent sample operations when
+crashes and restarts, tenant fairness, and idempotent sample operations when
 `TEST_DATABASE_URL` points to a dedicated PostgreSQL database.

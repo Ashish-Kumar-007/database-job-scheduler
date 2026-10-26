@@ -15,24 +15,25 @@ from alembic.config import Config
 from sqlalchemy import (
     create_engine as _sqlalchemy_create_engine,
     delete,
+    event,
     func,
     select,
     update,
 )
 from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 from app.config import Settings
 from app.consumers import Consumer
 from app.handlers import HandlerRegistry
-from app.handlers.sample import IdempotentSampleHandler
 from app.models import Job, JobStatus, Organization, SampleOperation
 from app.repositories.jobs import JobRepository
 from app.repositories.organizations import OrganizationRepository
 from app.services.errors import OrganizationNotFound
 from app.services.jobs import JobService
 from app.services.organizations import OrganizationService
-from app.workers import ExecutionOutcome, WorkerPool
+from app.workers import WorkerPool
 
 
 def sqlalchemy_create_engine(*args, **kwargs):
@@ -348,6 +349,72 @@ def test_future_job_is_not_claimed_early(
             connection.execute(delete(Job).where(Job.id == job.id))
             connection.execute(
                 delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_database_time_boundary_claims_past_and_equal_but_not_future_jobs(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organizations = [
+        OrganizationService(OrganizationRepository(sessions)).create(
+            f"schedule-boundary-{index}-{uuid4()}",
+            max_concurrent_jobs=1,
+        )
+        for index in range(3)
+    ]
+    repository = JobRepository(sessions)
+    jobs = []
+    try:
+        with engine.connect() as connection:
+            database_now = connection.scalar(select(func.clock_timestamp()))
+        assert database_now is not None
+
+        job_service = JobService(repository)
+        jobs = [
+            job_service.submit(
+                organization_id=organizations[0].id,
+                job_type="test.schedule-boundary",
+                payload={"boundary": "before"},
+                scheduled_at=database_now - timedelta(seconds=1),
+                max_attempts=1,
+            ),
+            job_service.submit(
+                organization_id=organizations[1].id,
+                job_type="test.schedule-boundary",
+                payload={"boundary": "equal"},
+                scheduled_at=database_now,
+                max_attempts=1,
+            ),
+            job_service.submit(
+                organization_id=organizations[2].id,
+                job_type="test.schedule-boundary",
+                payload={"boundary": "after"},
+                scheduled_at=database_now + timedelta(seconds=5),
+                max_attempts=1,
+            ),
+        ]
+
+        claims = repository.claim_due_jobs("schedule-boundary-consumer", limit=3)
+
+        assert {claim.job_id for claim in claims} == {
+            jobs[0].id,
+            jobs[1].id,
+        }
+        assert repository.get_by_id(jobs[2].id).status == JobStatus.SCHEDULED
+    finally:
+        with engine.begin() as connection:
+            if jobs:
+                connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(
+                    Organization.id.in_(
+                        [organization.id for organization in organizations]
+                    )
+                )
             )
         engine.dispose()
 
@@ -709,6 +776,62 @@ def test_failure_is_retryable_then_terminal_after_attempt_limit(
 
 
 @pytest.mark.integration
+def test_completed_and_failed_jobs_are_never_claimed_again(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organizations = [
+        OrganizationService(OrganizationRepository(sessions)).create(
+            f"terminal-state-{index}-{uuid4()}",
+            max_concurrent_jobs=1,
+        )
+        for index in range(2)
+    ]
+    jobs = [
+        JobService(JobRepository(sessions)).submit(
+            organization_id=organizations[index].id,
+            job_type="test.terminal",
+            payload={},
+            scheduled_at=datetime.now(UTC),
+            max_attempts=1,
+        )
+        for index in range(2)
+    ]
+    repository = JobRepository(sessions)
+    try:
+        claims = repository.claim_due_jobs("terminal-state-consumer", limit=2)
+        claims_by_job = {claim.job_id: claim for claim in claims}
+
+        completed_claim = claims_by_job[jobs[0].id]
+        assert repository.start_claim(completed_claim) is not None
+        assert repository.complete_claim(completed_claim)
+
+        failed_claim = claims_by_job[jobs[1].id]
+        assert repository.start_claim(failed_claim) is not None
+        assert repository.fail_claim(
+            failed_claim,
+            "permanent test failure",
+            retryable=False,
+        ) == JobStatus.FAILED
+
+        assert repository.claim_due_jobs("terminal-state-restart", limit=2) == []
+        assert repository.get_by_id(jobs[0].id).status == JobStatus.COMPLETED
+        assert repository.get_by_id(jobs[1].id).status == JobStatus.FAILED
+    finally:
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(
+                    Organization.id.in_(
+                        [organization.id for organization in organizations]
+                    )
+                )
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
 def test_expired_claim_recovery_fences_old_owner_and_exhausts_attempts(
     migrated_test_database: URL,
 ) -> None:
@@ -760,6 +883,7 @@ def test_expired_claim_recovery_fences_old_owner_and_exhausts_attempts(
             if claim.job_id == job.id
         )
         assert second_claim.attempts == 2
+        assert not repository.complete_claim(first_claim)
         with engine.begin() as connection:
             connection.execute(
                 update(Job)
@@ -877,28 +1001,38 @@ finally:
                         - func.make_interval(0, 0, 0, 0, 0, 0, 1)
                     )
                 )
-            assert repository.recover_expired_claims(retry_delay_seconds=0)
-
-            retry_claim = next(
-                claim
-                for claim in repository.claim_due_jobs("replacement-consumer")
-                if claim.job_id == job.id
+            restart_environment = environment.copy()
+            restart_environment.update(
+                {
+                    "CLAIM_BATCH_SIZE": "1",
+                    "CONSUMER_ID": "crash-recovery-replacement",
+                    "LEASE_REAP_INTERVAL_SECONDS": "0.05",
+                    "LEASE_SECONDS": "30",
+                    "POLL_INTERVAL_SECONDS": "0.01",
+                    "RETRY_BASE_SECONDS": "0.01",
+                    "RETRY_JITTER_RATIO": "0",
+                    "WORKER_CONCURRENCY": "1",
+                }
             )
-            handlers = HandlerRegistry()
-            handlers.register("sample.idempotent", IdempotentSampleHandler())
-            with WorkerPool(
-                repository,
-                handlers,
-                max_workers=1,
-                lease_seconds=30,
-            ) as worker_pool:
-                result = worker_pool.dispatch(retry_claim).result(timeout=10)
-            assert result.outcome == ExecutionOutcome.COMPLETED
-            assert result.result == {
-                "job_id": str(job.id),
-                "organization_id": str(organization.id),
-                "payload": {"operation": "durable"},
-            }
+            restart_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "app.consumers",
+                    "--max-completed",
+                    "1",
+                ],
+                cwd=project_root,
+                env=restart_environment,
+                stdin=subprocess.DEVNULL,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            restart_output = restart_result.stdout + restart_result.stderr
+            assert "claimed=1 completed=1" in restart_output
+            assert "recovered=1" in restart_output
             with sessions() as session:
                 operations = list(
                     session.scalars(
@@ -1061,6 +1195,80 @@ def test_consumer_worker_capacity_bounds_claimed_batch(
     finally:
         with engine.begin() as connection:
             connection.execute(delete(Job).where(Job.id.in_([job.id for job in jobs])))
+            connection.execute(
+                delete(Organization).where(Organization.id == organization.id)
+            )
+        engine.dispose()
+
+
+@pytest.mark.integration
+def test_consumer_resumes_after_transient_database_connectivity_failure(
+    migrated_test_database: URL,
+) -> None:
+    engine = sqlalchemy_create_engine(migrated_test_database, pool_pre_ping=True)
+    sessions = sessionmaker(bind=engine, expire_on_commit=False)
+    organization = OrganizationService(
+        OrganizationRepository(sessions)
+    ).create(f"transient-database-failure-{uuid4()}", max_concurrent_jobs=1)
+    job = _create_due_job(organization.id, sessions, job_type="test.outage")
+    failure_injected = False
+
+    def interrupt_one_statement(
+        connection,
+        cursor,
+        statement,
+        parameters,
+        context,
+        executemany,
+    ) -> None:
+        nonlocal failure_injected
+        if not failure_injected:
+            failure_injected = True
+            raise OperationalError(
+                statement,
+                parameters,
+                ConnectionError("simulated temporary database outage"),
+            )
+
+    settings = Settings(
+        database_url=migrated_test_database,
+        db_pool_size=5,
+        db_max_overflow=10,
+        consumer_id=f"transient-failure-consumer-{uuid4()}",
+        worker_concurrency=1,
+        poll_interval_seconds=0.01,
+        claim_batch_size=1,
+        lease_seconds=30,
+        shutdown_grace_seconds=2,
+        reconnect_base_seconds=0.01,
+        reconnect_max_seconds=0.02,
+        retry_base_seconds=0.01,
+        retry_max_seconds=1,
+        retry_jitter_ratio=0,
+        lease_reap_interval_seconds=1,
+    )
+    handlers = HandlerRegistry()
+    handlers.register("test.outage", lambda *args: "recovered")
+    repository = JobRepository(sessions)
+    event.listen(engine, "before_cursor_execute", interrupt_one_statement)
+    try:
+        with WorkerPool(repository, handlers, max_workers=1) as worker_pool:
+            result = Consumer(settings, repository, worker_pool).run(
+                Event(),
+                max_completed=1,
+            )
+
+        persisted = repository.get_by_id(job.id)
+        assert failure_injected
+        assert result.claimed == 1
+        assert result.completed == 1
+        assert persisted is not None
+        assert persisted.status == JobStatus.COMPLETED
+        assert persisted.attempts == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", interrupt_one_statement)
+        with engine.begin() as connection:
+            connection.execute(delete(Job).where(Job.id == job.id))
             connection.execute(
                 delete(Organization).where(Organization.id == organization.id)
             )
