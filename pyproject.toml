@@ -22,7 +22,7 @@ dev = [
 scheduler-consumer = "app.consumers.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

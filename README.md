@@ -164,6 +164,46 @@ Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object {
 python -m app.consumers
 ```
 
+## Reproducible demo
+
+Use a dedicated database with no existing jobs. The automated run refuses to
+start if the `jobs` table is non-empty because consumers poll the shared queue.
+Start PostgreSQL and apply migrations as above, then load the environment:
+
+```powershell
+Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object {
+    $name, $value = $_ -split '=', 2
+    Set-Item -Path "Env:$name" -Value $value
+}
+python -m alembic upgrade head
+python -m scripts.demo run
+```
+
+The automated demo creates three workload organizations plus a crash-test
+organization and 61 jobs. It mixes quick success, slow, retrying failure,
+idempotent, and future-scheduled jobs; kills a child after it commits the
+idempotent sample operation; waits for the lease to expire; and launches three
+independent consumers. It waits for all demo jobs to become completed or failed,
+then reports outcomes, retries, recovered jobs, scheduling delay, throughput,
+and state reconciliation. The completed demo data is retained for inspection.
+Remove only that run with the printed ID:
+
+```powershell
+python -m scripts.demo cleanup --run-id <run-id> --confirm
+```
+
+To seed jobs for a manually operated demo instead, run:
+
+```powershell
+python -m scripts.demo seed
+```
+
+The command prints a run ID and consumer/report commands. Start two or three
+consumers in separate terminals with `python -m app.consumers`, wait for the
+future jobs to become due, inspect the run using
+`python -m scripts.demo report --run-id <run-id>`, then stop the consumers with
+Ctrl+C.
+
 Stop PostgreSQL with `docker compose down`. Its named volume preserves data;
 `docker compose down --volumes` removes the local database volume.
 
