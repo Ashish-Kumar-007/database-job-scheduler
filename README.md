@@ -58,6 +58,46 @@ application database. The automated demo checks that the `jobs` table is empty
 before starting, but that check does not protect against other processes
 writing to the same database concurrently.
 
+### Run the complete stack in Docker
+
+Docker Compose runs PostgreSQL, migrations, consumers, and the demo from
+containers. Containers use the Compose network and connect to PostgreSQL by its
+service name; the host port is only for optional local tools. The database port
+is bound to loopback, and the named volume preserves state between restarts.
+
+The default host port is `5433` to avoid conflicts with a local PostgreSQL
+service on `5432`. If your `.env` already sets another `POSTGRES_HOST_PORT`,
+override it in the current PowerShell session before running Compose:
+
+```powershell
+$env:POSTGRES_HOST_PORT = "5433"
+docker compose up -d --build postgres
+docker compose ps
+docker compose --profile tools run --rm migrate
+```
+
+Run the complete crash-recovery demo in Docker. It launches three independent
+consumer OS processes inside the demo container:
+
+```powershell
+docker compose --profile tools run --rm demo python -m scripts.demo run
+```
+
+To leave three standalone consumer containers running instead:
+
+```powershell
+docker compose up -d --build --scale consumer=3 consumer
+docker compose logs -f consumer
+```
+
+Stop standalone consumers with `docker compose stop consumer`. Stop the stack
+without deleting its database with `docker compose down`; remove the local
+database volume only when you intend to delete its data:
+
+```powershell
+docker compose down --volumes
+```
+
 ### 1. Configure and start PostgreSQL
 
 ```powershell
